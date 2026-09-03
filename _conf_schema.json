@@ -1,0 +1,181 @@
+{
+    "enable": {
+        "description": "总开关",
+        "hint": "启用自主回复。启用前请确认 astrbot_plugin_astrbot_enhance_mode 已禁用、AstrBot 内置 active_reply 已关闭，避免双判定。",
+        "type": "bool",
+        "default": false
+    },
+    "trigger": {
+        "description": "触发与防抖",
+        "type": "object",
+        "items": {
+            "debounce_normal_seconds": {
+                "description": "普通消息防抖（秒）",
+                "hint": "群消息到达后等待该时长再合并判定，期间有新消息则重新计时。",
+                "type": "float",
+                "default": 5.0
+            },
+            "debounce_quick_seconds": {
+                "description": "快速通道防抖（秒）",
+                "hint": "@bot、疑问句、引用消息、关键词命中的消息走快速通道。",
+                "type": "float",
+                "default": 1.0
+            },
+            "min_reply_interval_seconds": {
+                "description": "最小回复间隔（秒）",
+                "hint": "同一会话两次主动回复之间的最小冷却时间，冷却期内放弃判定。",
+                "type": "float",
+                "default": 15.0
+            },
+            "quick_trigger_keywords": {
+                "description": "快速通道关键词",
+                "hint": "消息文本包含列表中任一关键词时走快速防抖通道。",
+                "type": "list",
+                "default": []
+            },
+            "max_pending_before_judge": {
+                "description": "待判定消息上限",
+                "hint": "每个会话最多缓存的待判定消息条数，超出丢弃最旧的。",
+                "type": "int",
+                "default": 20
+            }
+        }
+    },
+    "judge": {
+        "description": "判定（judge）",
+        "type": "object",
+        "items": {
+            "provider_id": {
+                "description": "判定提供商 ID",
+                "hint": "用于判断是否回复、锚定哪条消息的轻量模型，留空使用当前默认提供商。",
+                "type": "string",
+                "default": "deepseek/deepseek-v4-flash"
+            },
+            "history_messages": {
+                "description": "判定历史条数",
+                "hint": "构造判定提示词时附带的最近群聊历史行数。",
+                "type": "int",
+                "default": 30
+            },
+            "prompt_template": {
+                "description": "判定提示词模板",
+                "hint": "可用占位符：{persona_name} {persona_mask} {pending_count} {pending_msgs} {history_count} {history_lines}。JSON 示例行的大括号需写成 {{ }} 转义。",
+                "type": "text",
+                "default": "你当前的人格是:{persona_name}\n人格设定:{persona_mask}\n\n以下群聊最近 {pending_count} 条待判定消息:\n{pending_msgs}\n\n(历史上下文最近 {history_count} 条,已回复的已标为 [replied]):\n{history_lines}\n\n请以你的人格判断是否应该主动回复这些消息,并给出至多 1 个目标 msg_id:\n{{\"decision\":\"reply\",\"target_ids\":[\"msgid\"],\"reason\":\"...\"}}\n{{\"decision\":\"skip\",\"reason\":\"...\"}}\n只输出 JSON,不要额外文字。"
+            }
+        }
+    },
+    "generate": {
+        "description": "生成（generate）",
+        "type": "object",
+        "items": {
+            "provider_id": {
+                "description": "生成提供商 ID",
+                "hint": "用于生成回复内容的提供商，可指定视觉模型。留空使用当前默认提供商。",
+                "type": "string",
+                "_special": "select_provider",
+                "default": "deepseek-vision/deepseek-v4-flash-vision-exp"
+            },
+            "attach_recent_images": {
+                "description": "附带近期图片数",
+                "hint": "0=关闭；生成回复时最多附带的近期群聊图片原图数量。",
+                "type": "int",
+                "default": 3
+            },
+            "quote_policy": {
+                "description": "引用策略",
+                "hint": "judge=强制锚定判定目标（模型漏写引用标签时自动补）；model=仅信任模型自己写的引用并校验存在性；none=不做引用处理。",
+                "type": "string",
+                "options": ["judge", "model", "none"],
+                "default": "judge"
+            },
+            "include_role_tag": {
+                "description": "历史包含角色标签",
+                "hint": "在历史消息格式中写入 (admin)/(member) 角色标记。",
+                "type": "bool",
+                "default": true
+            },
+            "include_sender_id": {
+                "description": "历史包含发送者 ID",
+                "hint": "在历史消息格式中写入发送者用户 ID。",
+                "type": "bool",
+                "default": true
+            }
+        }
+    },
+    "anti_repeat": {
+        "description": "防重复",
+        "type": "object",
+        "items": {
+            "enable": {
+                "description": "启用防重复",
+                "type": "bool",
+                "default": true
+            },
+            "similarity_threshold": {
+                "description": "相似度阈值",
+                "hint": "与近期回复的相似度超过该值视为重复（0-1）。",
+                "type": "float",
+                "default": 0.85
+            },
+            "max_retries": {
+                "description": "重复重试次数",
+                "hint": "判定重复后重新生成的最多次数，仍重复则放弃发送。",
+                "type": "int",
+                "default": 1
+            },
+            "compare_window": {
+                "description": "比较窗口",
+                "hint": "与 bot 自己最近 N 条回复比较相似度。",
+                "type": "int",
+                "default": 10
+            }
+        }
+    },
+    "history": {
+        "description": "历史记录",
+        "type": "object",
+        "items": {
+            "max_messages": {
+                "description": "最大历史条数",
+                "hint": "每个会话保留的最大群聊历史行数，超出后淘汰最旧记录并回收其图片注册。",
+                "type": "int",
+                "default": 50
+            }
+        }
+    },
+    "whitelist": {
+        "description": "会话白名单",
+        "type": "object",
+        "items": {
+            "allowed_origins": {
+                "description": "允许的会话",
+                "hint": "unified_msg_origin 或群号列表。留空表示所有群聊均生效。",
+                "type": "list",
+                "default": []
+            }
+        }
+    },
+    "global_settings": {
+        "description": "全局设置",
+        "type": "object",
+        "items": {
+            "max_origins": {
+                "description": "会话状态上限",
+                "hint": "内存中最多保留多少个会话的运行状态，超出按 LRU 淘汰。",
+                "type": "int",
+                "default": 500
+            },
+            "judge_timeout_sec": {
+                "description": "判定超时（秒）",
+                "type": "float",
+                "default": 45.0
+            },
+            "generate_timeout_sec": {
+                "description": "生成超时（秒）",
+                "type": "float",
+                "default": 60.0
+            }
+        }
+    }
+}
