@@ -8,8 +8,8 @@
 - **版本**: v0.1.0
 - **作者**: Soul-Charge
 - **定位**: 自主回复（主动回复/触发式回复），单职责，不做记忆/图片转述/WebUI
-- **开发由来**: 由 Soul-Charge 发起、AI 辅助从零开发；早期文档中的“阿汐”为参考 enhance_mode 时误带入的署名，非实际作者。
-- **参考**: `astrbot_plugin_astrbot_enhance_mode`（作者 Axi404/阿汐，https://github.com/Axi404/astrbot_plugin_astrbot_enhance_mode），借鉴其标签约定、历史格式与主动回复分层思路。
+- **开发由来**: Soul-Charge 只提出“做一个自主回复插件”的需求，未预先设计内部结构；AI 从零生成实现，用户未深入理解/参与内部架构设计。
+- **参考说明**: AI 在实现时自行参考了环境中已安装的 `astrbot_plugin_astrbot_enhance_mode`（作者 Axi404/阿汐，https://github.com/Axi404/astrbot_plugin_astrbot_enhance_mode），借鉴其标签约定、历史格式与主动回复分层思路；用户最初未意识到这一参考。早期文档中的“阿汐”因此误入，非实际作者。
 
 ## 前置条件（施工前检查）
 

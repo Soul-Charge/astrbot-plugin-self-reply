@@ -4,15 +4,17 @@
 
 ## 开发由来与参考
 
-本插件由 **Soul-Charge** 发起，使用 AI 辅助从零开发，用于替代/补充 AstrBot 的主动回复能力，定位为单职责的“自主回复”插件。
+本插件由 **Soul-Charge**（用户）向 AI 提出需求并监督完成。用户没有预先设计内部架构，也没有深入理解插件结构，主要是以“发号施令”的方式让 AI 从零实现一个自主回复插件。
 
-开发过程中参考了本地已有的 `astrbot_plugin_astrbot_enhance_mode`（作者：Axi404 / 阿汐，仓库：https://github.com/Axi404/astrbot_plugin_astrbot_enhance_mode），主要借鉴其交互约定与设计思路：
+实际开发过程中，AI 自行参考了用户环境中已经安装的 `astrbot_plugin_astrbot_enhance_mode`（作者：Axi404 / 阿汐，仓库：https://github.com/Axi404/astrbot_plugin_astrbot_enhance_mode），并借鉴了其交互约定与设计思路：
 
 - `<quote id="..."/>`、`<mention id="..."/>`、`<refuse/>` 等控制标签约定
 - 带 `#msgID` 的结构化群聊历史格式
 - 主动回复/判定的分层思想、防重复与冷却机制
 
-本插件的代码为实现“自主回复”这一职责而独立编写/裁剪，并非 `astrbot_plugin_astrbot_enhance_mode` 的复制品。
+用户一开始并没有意识到 AI 参考了这个已安装插件；后来检查文档时才发现作者名和部分结构带有 enhance_mode 的痕迹。
+
+本插件代码由 AI 为实现“自主回复”这一需求而生成/整理，并非用户手工设计，也不是 `astrbot_plugin_astrbot_enhance_mode` 的官方作品或复制品。
 
 > 说明：早期规划文档中 `author` 曾写成“阿汐”，这是参考 enhance_mode 时误带入的署名；本插件实际作者为 **Soul-Charge**。
 

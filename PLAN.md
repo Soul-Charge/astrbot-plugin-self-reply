@@ -61,7 +61,7 @@ author: Soul-Charge
 repo: ""
 ```
 
-> 开发由来：本插件由 Soul-Charge 发起、AI 辅助从零开发。早期文档中的“阿汐”是参考 `astrbot_plugin_astrbot_enhance_mode`（作者 Axi404/阿汐）时误带入的署名，非实际作者。
+> 开发由来：Soul-Charge 只提出“做一个自主回复插件”的需求，未预先设计内部结构；AI 从零生成实现，用户未深入理解/参与内部架构设计。AI 在实现时自行参考了环境中已安装的 `astrbot_plugin_astrbot_enhance_mode`（作者 Axi404/阿汐），用户最初未意识到这一参考。早期文档中的“阿汐”因此误入，非实际作者。
 
 ## 3. 配置文件 ( `_conf_schema.json` + `plugin_config.py` )
 
