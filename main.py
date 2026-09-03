@@ -487,7 +487,12 @@ class Main(star.Star):
                 ),
                 timeout=cfg.global_settings.generate_timeout_sec,
             )
-            return r.completion_text or ""
+            text = r.completion_text or ""
+            if not text.strip():
+                # 某些模型/兼容网关会在 content 为空时把实际回复放在
+                # reasoning_content 字段里；这里做兜底，避免把有效回复当空内容丢弃。
+                text = r.reasoning_content or ""
+            return text
         except asyncio.TimeoutError:
             logger.error("self-reply | generate timeout")
             return ""
