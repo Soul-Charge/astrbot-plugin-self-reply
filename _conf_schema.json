@@ -84,7 +84,7 @@
             },
             "quote_policy": {
                 "description": "引用策略",
-                "hint": "judge=强制锚定判定目标（模型漏写引用标签时自动补）；model=仅信任模型自己写的引用并校验存在性；none=不做引用处理。",
+                "hint": "judge=仅对问句自动引用（模型漏写引用标签时自动补）；model=仅信任模型自己写的引用并校验存在性；none=不做引用处理。",
                 "type": "string",
                 "options": ["judge", "model", "none"],
                 "default": "judge"

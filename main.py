@@ -30,8 +30,22 @@ from .tag_utils import (
 
 MSG_ID_LINE_RE = re.compile(r"#msg(\w+)")
 
+# 识别“值得引用回复”的特别问句，避免所有自主回复都变成引用模式
+_QUESTION_RE = re.compile(
+    r"[?？]|吗|呢|嘛|什么|怎么|怎样|如何|为什么|为啥|哪|谁|多少|几|"
+    r"是不是|能不能|可不可以|要不要|有没有|是否",
+    re.IGNORECASE,
+)
+
 # 同一 (发送者, 文本) 在该窗口内的事件视为同一条消息（平台可能双投递：纯文本+At 各一条）
 _DUP_TEXT_WINDOW_SEC = 10.0
+
+
+def is_question_text(text: str) -> bool:
+    t = (text or "").strip()
+    if not t or t == "[Empty]":
+        return False
+    return bool(_QUESTION_RE.search(t))
 
 
 def extract_msg_id_from_line(line: str) -> str | None:
@@ -315,6 +329,21 @@ class Main(star.Star):
                     target_lines.append(f"#msg{t} {p['nick']}: [{p['text']}]")
             targets_str = "\n".join(target_lines) or "the recent message"
 
+            # 只有目标消息是“特别问句”时才使用引用回复；
+            # 普通群聊发言应直接说话，不再每条都强制引用。
+            should_quote = any(
+                is_question_text(pending_by_id.get(t, {}).get("text", ""))
+                for t in ok_targets
+            )
+            quote_rule = (
+                f'Rule: start with <quote id="{ok_targets[0]}"/> then your natural reply. '
+                if should_quote
+                else (
+                    "Reply naturally in the chatroom as a normal group message. "
+                    "Do not use a quote tag in this reply.\n"
+                )
+            )
+
             history_text = "\n".join(history_slice)
             # 生成阶段同样需要人格锚定，否则模型只会收到“chatroom”裸提示
             _, persona_prompt = await self._resolve_persona(origin)
@@ -329,7 +358,7 @@ class Main(star.Star):
             gen_prompt = (
                 f"You are in a chatroom. Chat history:\n{history_text}\n\n"
                 f"You decided to reply to:\n{targets_str}\n\n"
-                f'Rule: start with <quote id="{ok_targets[0]}"/> then your natural reply. '
+                f"{quote_rule}"
                 "Output only your reply, nothing else. Use the same language as the chatroom.\n"
                 f"{anti_repeat_instr}"
             )
@@ -399,8 +428,17 @@ class Main(star.Star):
             # Tags
             allowed_ids = {extract_msg_id_from_line(l) for l in history_slice}
             allowed_ids.discard(None)
+
+            # 只有问句才允许引用；普通直接回复即使模型误加了 quote 标签也会被剥掉
+            quote_allowed = should_quote and cfg.generate.quote_policy != "none"
+            if not quote_allowed:
+                response_text = QUOTE_RE.sub("", response_text)
+                response_text = QUOTE_CLOSE_RE.sub("", response_text)
+                if not response_text.strip():
+                    logger.info("self-reply | empty after removing quote; skip")
+                    return
             chain = [Plain(response_text)]
-            if cfg.generate.quote_policy == "judge" and ok_targets:
+            if quote_allowed and cfg.generate.quote_policy == "judge" and ok_targets:
                 if not any(isinstance(c, Reply) for c in chain):
                     if not QUOTE_RE.search(response_text):
                         chain = [Reply(id=ok_targets[0])] + chain
