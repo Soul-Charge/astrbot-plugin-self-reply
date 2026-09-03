@@ -2,6 +2,20 @@
 
 自主回复插件：bot 在群聊中无需被 @，按防抖节流自主判断是否发言；普通聊天直接发言，仅在回复特别问句时使用引用模式，并防止重复刷屏。
 
+## 开发由来与参考
+
+本插件由 **Soul-Charge** 发起，使用 AI 辅助从零开发，用于替代/补充 AstrBot 的主动回复能力，定位为单职责的“自主回复”插件。
+
+开发过程中参考了本地已有的 `astrbot_plugin_astrbot_enhance_mode`（作者：Axi404 / 阿汐，仓库：https://github.com/Axi404/astrbot_plugin_astrbot_enhance_mode），主要借鉴其交互约定与设计思路：
+
+- `<quote id="..."/>`、`<mention id="..."/>`、`<refuse/>` 等控制标签约定
+- 带 `#msgID` 的结构化群聊历史格式
+- 主动回复/判定的分层思想、防重复与冷却机制
+
+本插件的代码为实现“自主回复”这一职责而独立编写/裁剪，并非 `astrbot_plugin_astrbot_enhance_mode` 的复制品。
+
+> 说明：早期规划文档中 `author` 曾写成“阿汐”，这是参考 enhance_mode 时误带入的署名；本插件实际作者为 **Soul-Charge**。
+
 ## 用途
 
 在群聊场景下，为 bot 提供一套克制的"主动搭话"能力：

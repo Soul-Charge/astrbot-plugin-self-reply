@@ -1,5 +1,5 @@
 name: astrbot_plugin_self_reply
 desc: 自主回复插件 - 防抖触发 + 结构化判定 + 引用锚定 + 防重复
 version: v0.1.1
-author: 阿汐
+author: Soul-Charge
 repo: "https://github.com/Soul-Charge/astrbot-plugin-self-reply.git"

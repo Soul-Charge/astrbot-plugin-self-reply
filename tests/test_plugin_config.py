@@ -38,14 +38,14 @@ def test_defaults_on_empty_config():
 
 def test_prompt_template_formatable_with_judge_kwargs():
     rendered = DEFAULT_JUDGE_PROMPT.format(
-        persona_name="阿汐",
+        persona_name="Soul-Charge",
         persona_mask="mask",
         pending_count=3,
         pending_msgs="msgs",
         history_count=10,
         history_lines="lines",
     )
-    assert "阿汐" in rendered
+    assert "Soul-Charge" in rendered
     assert '{"decision":"reply"' in rendered
     assert parse_plugin_config({}).judge.prompt_template.format(
         persona_name="x",

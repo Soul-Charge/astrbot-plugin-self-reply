@@ -57,9 +57,11 @@ requirements.txt:
 name: astrbot_plugin_self_reply
 desc: 自主回复插件 - 防抖触发 + 结构化判定 + 引用锚定 + 防重复
 version: v0.1.0
-author: 阿汐
+author: Soul-Charge
 repo: ""
 ```
+
+> 开发由来：本插件由 Soul-Charge 发起、AI 辅助从零开发。早期文档中的“阿汐”是参考 `astrbot_plugin_astrbot_enhance_mode`（作者 Axi404/阿汐）时误带入的署名，非实际作者。
 
 ## 3. 配置文件 ( `_conf_schema.json` + `plugin_config.py` )
 

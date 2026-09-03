@@ -6,8 +6,10 @@
 
 - **目录**: `data/plugins/astrbot_plugin_self_reply/`
 - **版本**: v0.1.0
-- **作者**: 阿汐
+- **作者**: Soul-Charge
 - **定位**: 自主回复（主动回复/触发式回复），单职责，不做记忆/图片转述/WebUI
+- **开发由来**: 由 Soul-Charge 发起、AI 辅助从零开发；早期文档中的“阿汐”为参考 enhance_mode 时误带入的署名，非实际作者。
+- **参考**: `astrbot_plugin_astrbot_enhance_mode`（作者 Axi404/阿汐，https://github.com/Axi404/astrbot_plugin_astrbot_enhance_mode），借鉴其标签约定、历史格式与主动回复分层思路。
 
 ## 前置条件（施工前检查）
 
