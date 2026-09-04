@@ -62,6 +62,90 @@ def clean_text(text: str) -> str:
     return text.strip()
 
 
+def is_directed_to_other(event: AstrMessageEvent, self_id: str) -> bool:
+    """判断消息是否明确写给/引用了除 bot 以外的某个群友。
+
+    这类消息通常是在和其他人对话，不应作为“发给 bot”的自主回复候选。
+    注意：bot 自己发起的消息已在调用前被过滤。
+    """
+    self_id_s = str(self_id or "")
+    if not self_id_s:
+        return False
+    for comp in event.get_messages():
+        if isinstance(comp, Reply):
+            sid = str(getattr(comp, "sender_id", "") or "")
+            # sender_id 可能因平台未取到引用消息而为 0/空，此时无法判断，不拦截
+            if sid and sid not in ("0", self_id_s):
+                return True
+        elif isinstance(comp, At):
+            qq = str(getattr(comp, "qq", "") or "")
+            if qq and qq.lower() != "all" and qq != self_id_s:
+                return True
+    return False
+
+
+# 历史行形如 [昵称/QQ/时间](角色) #msg123: ...；bot 自己的行是 [You/时间]: ...
+_HIST_SENDER_RE = re.compile(
+    r"^\[([^/\]]+)/([^/\]]+)/([^\]]+)\](?:\([^)]*\))?\s*#msg"
+)
+_BOT_HIST_PREFIX = "[You/"
+_CJK_RE = re.compile(r"[\u4e00-\u9fff]")
+
+
+def _recent_sender_ids(state, max_count: int = 5) -> list[str]:
+    """从会话历史中提取最近若干条消息的发送者 ID。
+
+    解析失败或未开启 sender_id 展示时返回空列表，调用方应视为“无法判断”。
+    bot 自己的消息用 "__bot__" 表示。
+    """
+    ids: list[str] = []
+    for line in reversed(state.session_chats):
+        m = _HIST_SENDER_RE.match(line)
+        if m:
+            ids.append(m.group(2))
+        elif line.startswith(_BOT_HIST_PREFIX):
+            ids.append("__bot__")
+        else:
+            return []
+        if len(ids) >= max_count:
+            break
+    return list(reversed(ids))
+
+
+def _is_reaction_only(text: str, has_image: bool) -> bool:
+    """判断是否属于“短反应”类消息（表情、单字、纯图等）。
+
+    中文“小盐”这类两个字的人名/称呼不算短反应，避免误伤点名。
+    """
+    t = (text or "").strip()
+    if not t or t == "[Empty]":
+        return True
+    if _CJK_RE.search(t):
+        # 中文单字/语气词算反应；两个以上中文字更可能是完整称呼或短句
+        return len(t) <= 1
+    # 非中文内容：emoji、颜文字、短英文数字等
+    return len(t) <= 4
+
+
+def _in_other_side_conversation(state, sender_id: str) -> bool:
+    """若最近几条是另外两个群友之间的一对一往来，且 bot 未参与，返回 True。
+
+    只用于抑制“短反应类”消息，避免 bot 把别人聊天中的表情/单字当成发给自己的。
+    """
+    ids = _recent_sender_ids(state, max_count=5)
+    if len(ids) < 3:
+        return False
+    # bot 刚说过话时不视为纯旁听
+    if "__bot__" in ids[-3:]:
+        return False
+    human_ids = [i for i in ids if i != "__bot__"]
+    if len(human_ids) < 3:
+        return False
+    if len(set(human_ids)) != 2:
+        return False
+    return str(sender_id) in set(human_ids)
+
+
 class Main(star.Star):
     def __init__(self, context: Context, config: dict | None = None):
         super().__init__(context, config)
@@ -180,6 +264,18 @@ class Main(star.Star):
 
         # 唤醒消息交由主流水线响应
         if is_wake:
+            return
+
+        # 明确引用/At 其他群友的消息，通常是在和其他人对话；
+        # 仍保留在上面的历史上下文中，但不进入自主回复的待判定队列。
+        if is_directed_to_other(event, self_id):
+            return
+
+        # 别人正在一对一闲聊时，纯表情/单字/图片这类“反应”通常不是发给 bot 的。
+        # 这里只拦短反应，不拦完整发言；历史仍保留，方便后续上下文理解。
+        if _is_reaction_only(text, bool(image_urls)) and _in_other_side_conversation(
+            state, str(sender_id)
+        ):
             return
 
         # pending
@@ -356,8 +452,17 @@ class Main(star.Star):
                 )
 
             gen_prompt = (
-                f"You are in a chatroom. Chat history:\n{history_text}\n\n"
-                f"You decided to reply to:\n{targets_str}\n\n"
+                "You are one participant in a multi-person group chatroom, "
+                "not necessarily the addressee of every message.\n"
+                f"Chat history:\n{history_text}\n\n"
+                "You have decided to proactively speak in this chatroom. "
+                "The following are the recent message(s) you are responding to or commenting on:\n"
+                f"{targets_str}\n\n"
+                "Do NOT assume those messages were addressed to you unless they @, quote, "
+                "or clearly mention you. If they are between other members, you may still "
+                "naturally join the group conversation when appropriate, but do not claim "
+                "they were talking to you or treat yourself as the topic unless the evidence "
+                "shows that.\n\n"
                 f"{quote_rule}"
                 "Output only your reply, nothing else. Use the same language as the chatroom.\n"
                 f"{anti_repeat_instr}"
