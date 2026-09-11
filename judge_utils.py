@@ -34,6 +34,24 @@ DEFAULT_JUDGE_PROMPT = (
     "只输出 JSON,不要额外文字。"
 )
 
+DEFAULT_GENERATE_PROMPT = (
+    "你正在以「小盐」的软萌猫娘身份参与群聊，对群友的消息生成一句插话回应。\n\n"
+    "群聊历史:\n"
+    "{history_text}\n\n"
+    "你决定针对以下消息进行插话回应:\n"
+    "{targets_str}\n\n"
+    "1. 先判断对方的真实情绪，再决定回应方式：\n"
+    "   - 句尾括号（如（悲（哭（恼（乐）是对方的真实情绪注脚，以括号为准；\n"
+    "   - 对方难过、心疼、诉苦、自嘲倒霉 → 软软安慰、摸摸、陪ta叹气；\n"
+    "   - 对方明确在开心、整活、玩梗 → 才跟着调侃吐槽；\n"
+    "   - 拿不准 → 温和中性回应，不要反讽、不要倒打一耙。\n"
+    "2. 回应必须忠于对方实际表达的意思，不臆测、不捏造对方没有表现出的态度（例如对方在诉苦时，禁止说成对方在笑/在得意）。\n"
+    "3. 一两句话，口语化，不用列表、不用格式化排版，符合群聊闲聊氛围。\n"
+    "不要以为所有消息都是对你说的。只有在有明确证据时才把自己当话题。直接输出回复内容，不要额外解释。\n"
+    "{quote_rule}"
+    "{anti_repeat_instr}"
+)
+
 
 def parse_judge_output(raw: str, fallback_id: str) -> dict:
     """
@@ -43,10 +61,22 @@ def parse_judge_output(raw: str, fallback_id: str) -> dict:
     if not raw:
         return {"decision": "skip", "target_ids": [], "reason": "empty"}
     text = raw.strip()
+
+    candidates = []
     m = JSON_RE.search(text)
     if m:
+        candidates.append(m.group())
+
+    if "{" in text:
+        start_idx = text.find("{")
+        sub = text[start_idx:].strip()
+        if not sub.endswith("}"):
+            candidates.append(sub + "}")
+        candidates.append(sub)
+
+    for cand in candidates:
         try:
-            obj = json.loads(m.group())
+            obj = json.loads(cand)
             dec = str(obj.get("decision", "")).lower().strip()
             ids = obj.get("target_ids") or []
             if not isinstance(ids, list):
@@ -59,13 +89,25 @@ def parse_judge_output(raw: str, fallback_id: str) -> dict:
                     "reason": str(obj.get("reason", "")),
                 }
         except Exception:
-            pass
+            continue
+
+    # 正则提取 decision 与 target_ids 作为容错兜底
+    lower_text = text.lower()
+    if '"decision": "reply"' in lower_text or '"decision":"reply"' in lower_text:
+        target_ids = re.findall(r'"(msg\d+|\d+)"', text)
+        valid_ids = [tid for tid in target_ids if tid.startswith("msg") or tid.isdigit()]
+        return {
+            "decision": "reply",
+            "target_ids": valid_ids if valid_ids else ([fallback_id] if fallback_id else []),
+            "reason": "regex-extracted reply",
+        }
+
     # 兼容 REPLY/SKIP
     tok = text.split()[0].upper() if text else ""
     if tok.startswith("REPLY"):
         return {
             "decision": "reply",
-            "target_ids": [fallback_id],
+            "target_ids": [fallback_id] if fallback_id else [],
             "reason": "fallback REPLY parse",
         }
     return {"decision": "skip", "target_ids": [], "reason": "fallback SKIP parse"}

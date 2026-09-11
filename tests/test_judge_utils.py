@@ -84,3 +84,12 @@ def test_malformed_json_falls_to_token_path():
 def test_plain_prose_defaults_to_skip():
     out = parse_judge_output("这是一段没有任何格式的文字", "999")
     assert out["decision"] == "skip"
+
+
+def test_truncated_json_missing_brace():
+    raw = '{"decision":"reply","target_ids":["msg856257937"],"reason":"在催窝说话，就被拦了一下下喵~"'
+    out = parse_judge_output(raw, "999")
+    assert out["decision"] == "reply"
+    assert out["target_ids"] == ["msg856257937"]
+    assert "在催窝说话" in out["reason"]
+
