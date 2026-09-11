@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import re
+import sys
 import time
 from collections import deque
 from datetime import datetime
@@ -15,7 +17,9 @@ from astrbot.api.star import Context
 from astrbot.core.star.star_tools import StarTools
 
 from .image_resolver import resolve
-from .judge_utils import parse_judge_output
+from .judge_utils import DEFAULT_GENERATE_PROMPT, parse_judge_output
+from .kb_bridge import retrieve_kb_block
+from .memory_bridge import EventShim, MemoryBridge, truncate_text
 from .plugin_config import PluginConfig, parse_plugin_config
 from .reply_tracker import ReplyTracker
 from .runtime_state import OriginState, RuntimeState
@@ -29,6 +33,14 @@ from .tag_utils import (
 )
 
 MSG_ID_LINE_RE = re.compile(r"#msg(\w+)")
+
+# 会话重置清理必须最先执行：AstrBot 的 hook 链一旦遇到 event.is_stopped()
+# 就会中断后续 handler（见 core/pipeline/context_utils.py），而 /reset 这类
+# 命令事件常常在进入 RespondStage 前就已被 stop，导致排在后面的钩子收不到通知。
+RESET_HOOK_PRIORITY = sys.maxsize
+
+# 召回内容注入占位符
+RECALL_PLACEHOLDER = "{recalled_memories}"
 
 # 识别“值得引用回复”的特别问句，避免所有自主回复都变成引用模式
 _QUESTION_RE = re.compile(
@@ -51,6 +63,17 @@ def is_question_text(text: str) -> bool:
 def extract_msg_id_from_line(line: str) -> str | None:
     m = MSG_ID_LINE_RE.search(line)
     return m.group(1) if m else None
+
+
+def safe_event_str(event, method_name: str) -> str:
+    """安全调用事件上的无参取值方法（兼容精简/自定义事件对象）。"""
+    getter = getattr(event, method_name, None)
+    if not callable(getter):
+        return ""
+    try:
+        return str(getter() or "")
+    except Exception:
+        return ""
 
 
 def clean_text(text: str) -> str:
@@ -153,6 +176,7 @@ class Main(star.Star):
         self.runtime = RuntimeState()
         self.runtime.max_origins = self._config.global_settings.max_origins
         self.tracker = ReplyTracker()
+        self.memory = MemoryBridge(context)
 
     def _cfg(self) -> PluginConfig:
         return self._config
@@ -288,6 +312,11 @@ class Main(star.Star):
                 "has_image": bool(image_urls),
                 "role": role,
                 "ts": time.time(),
+                # 供记忆召回构造轻量事件 shim（防抖触发时真实事件已结束）
+                "group_id": safe_event_str(event, "get_group_id"),
+                "platform": safe_event_str(event, "get_platform_name"),
+                "platform_id": safe_event_str(event, "get_platform_id"),
+                "self_id": str(self_id or ""),
             }
         )
         if len(state.pending_messages) > cfg.trigger.max_pending_before_judge:
@@ -342,6 +371,11 @@ class Main(star.Star):
         if not state.pending_messages:
             return
 
+        # 自愈兜底：核心会话被 /reset 或 /new 重置时，钩子链可能因
+        # event.is_stopped() 提前中断，这里再按会话指纹检测一次。
+        if await self._detect_core_session_reset(origin, state):
+            return
+
         async with state.lock:
             pending = list(state.pending_messages)
             state.pending_messages.clear()
@@ -352,15 +386,30 @@ class Main(star.Star):
                 )
                 return
 
+            # 记忆 / 知识库召回（判定与生成共用同一次结果）
+            persona_id, persona_name, persona_prompt = await self._resolve_persona(
+                origin
+            )
+            shim = self._build_event_shim(origin, pending)
+            recall_query = self._build_recall_query(pending)
+            recall_block = await self._build_recall_block(
+                origin, shim, recall_query, persona_id, cfg
+            )
+            judge_recall = recall_block if cfg.memory.inject_into_judge else ""
+
             # Build judge input
             history_slice = state.session_chats[-cfg.judge.history_messages :]
             judge_prompt = cfg.judge.prompt_template.format(
-                persona_name=await self._resolve_persona_name(origin),
-                persona_mask=await self._resolve_persona_mask(origin),
+                persona_name=persona_name,
+                persona_mask=persona_prompt,
                 pending_count=len(pending),
                 pending_msgs=self._format_pending(pending, state, cfg),
                 history_count=len(history_slice),
                 history_lines="\n".join(history_slice),
+                recalled_memories=judge_recall,
+            )
+            judge_prompt = self._append_recall_if_missing(
+                judge_prompt, cfg.judge.prompt_template, judge_recall
             )
 
             provider = self._resolve_provider(cfg.judge.provider_id or None)
@@ -442,7 +491,6 @@ class Main(star.Star):
 
             history_text = "\n".join(history_slice)
             # 生成阶段同样需要人格锚定，否则模型只会收到“chatroom”裸提示
-            _, persona_prompt = await self._resolve_persona(origin)
             anti_repeat_instr = ""
             if cfg.anti_repeat.enable and recent_own:
                 anti_repeat_instr = (
@@ -451,21 +499,55 @@ class Main(star.Star):
                     + "\n请勿重复以上内容，但保持你自己的人格语气。\n"
                 )
 
-            gen_prompt = (
-                "You are one participant in a multi-person group chatroom, "
-                "not necessarily the addressee of every message.\n"
-                f"Chat history:\n{history_text}\n\n"
-                "You have decided to proactively speak in this chatroom. "
-                "The following are the recent message(s) you are responding to or commenting on:\n"
-                f"{targets_str}\n\n"
-                "Do NOT assume those messages were addressed to you unless they @, quote, "
-                "or clearly mention you. If they are between other members, you may still "
-                "naturally join the group conversation when appropriate, but do not claim "
-                "they were talking to you or treat yourself as the topic unless the evidence "
-                "shows that.\n\n"
-                f"{quote_rule}"
-                "Output only your reply, nothing else. Use the same language as the chatroom.\n"
-                f"{anti_repeat_instr}"
+            prompt_tmpl = (
+                getattr(cfg.generate, "prompt_template", None)
+                or DEFAULT_GENERATE_PROMPT
+            )
+            if "{history_text}" in prompt_tmpl and "{targets_str}" in prompt_tmpl:
+                try:
+                    gen_prompt = prompt_tmpl.format(
+                        history_text=history_text,
+                        targets_str=targets_str,
+                        quote_rule=quote_rule,
+                        anti_repeat_instr=anti_repeat_instr,
+                        recalled_memories=recall_block,
+                    )
+                except Exception as e:
+                    logger.warning(
+                        f"self-reply | format prompt_template 失败: {e}，回退标准拼接"
+                    )
+                    gen_prompt = (
+                        f"{prompt_tmpl}\n\n"
+                        f"Chat history:\n{history_text}\n\n"
+                        f"The following are the recent message(s) you are responding to or commenting on:\n"
+                        f"{targets_str}\n\n"
+                        "Do NOT assume those messages were addressed to you unless they @, quote, "
+                        "or clearly mention you. If they are between other members, you may still "
+                        "naturally join the group conversation when appropriate, but do not claim "
+                        "they were talking to you or treat yourself as the topic unless the evidence "
+                        "shows that.\n\n"
+                        f"{quote_rule}"
+                        "Output only your reply, nothing else. Use the same language as the chatroom.\n"
+                        f"{anti_repeat_instr}"
+                    )
+            else:
+                gen_prompt = (
+                    f"{prompt_tmpl}\n\n"
+                    f"Chat history:\n{history_text}\n\n"
+                    f"The following are the recent message(s) you are responding to or commenting on:\n"
+                    f"{targets_str}\n\n"
+                    "Do NOT assume those messages were addressed to you unless they @, quote, "
+                    "or clearly mention you. If they are between other members, you may still "
+                    "naturally join the group conversation when appropriate, but do not claim "
+                    "they were talking to you or treat yourself as the topic unless the evidence "
+                    "shows that.\n\n"
+                    f"{quote_rule}"
+                    "Output only your reply, nothing else. Use the same language as the chatroom.\n"
+                    f"{anti_repeat_instr}"
+                )
+
+            gen_prompt = self._append_recall_if_missing(
+                gen_prompt, prompt_tmpl, recall_block
             )
 
             gen_provider_id = cfg.generate.provider_id or None
@@ -557,6 +639,14 @@ class Main(star.Star):
                 return
 
             # Send
+            # 在途守卫：生成期间若发生 /reset（状态已被清理或重建），
+            # 说明本轮回复基于已作废的上下文，直接丢弃。
+            if self.runtime.get(origin) is not state:
+                logger.info(
+                    f"self-reply | 会话在生成期间被重置，丢弃本轮回复 origin={origin}"
+                )
+                return
+
             chain_obj = MessageChain(chain=transformed)
             await StarTools.send_message(origin, chain_obj)
 
@@ -572,6 +662,14 @@ class Main(star.Star):
                 if rid:
                     state.image_registry.pop(rid, None)
             logger.info(f"self-reply | sent origin={origin} targets={ok_targets}")
+
+            # 可选：把自主回复写回长期记忆插件，让纯插话群聊也能触发反思/总结
+            if cfg.memory.record_bot_reply and shim is not None:
+                await self.memory.record_bot_reply(
+                    shim=shim,
+                    text=clean_text(response_text),
+                    timeout=cfg.memory.timeout_sec,
+                )
 
     async def _generate(
         self,
@@ -607,7 +705,8 @@ class Main(star.Star):
 
     # ---------------- 工具函数 ----------------
 
-    async def _resolve_persona(self, origin: str) -> tuple[str, str]:
+    async def _resolve_persona(self, origin: str) -> tuple[str, str, str]:
+        """解析当前会话人格，返回 (persona_id, persona_name, persona_prompt)。"""
         persona_id = ""
         try:
             session_service_config = await sp.get_async(
@@ -647,7 +746,7 @@ class Main(star.Star):
                 persona_id = ""
 
         if persona_id == "[%None]":
-            return "none", "No persona mask."
+            return "", "none", "No persona mask."
 
         persona = None
         if persona_id:
@@ -675,15 +774,209 @@ class Main(star.Star):
         persona_prompt = str(persona.get("prompt") or "").strip()
         if not persona_prompt:
             persona_prompt = "You are a helpful and friendly assistant."
-        return persona_name, persona_prompt
+        return persona_id, persona_name, persona_prompt
 
     async def _resolve_persona_name(self, origin: str) -> str:
-        name, _ = await self._resolve_persona(origin)
+        _, name, _ = await self._resolve_persona(origin)
         return name
 
     async def _resolve_persona_mask(self, origin: str) -> str:
-        _, mask = await self._resolve_persona(origin)
+        _, _, mask = await self._resolve_persona(origin)
         return mask
+
+    # ---------------- 记忆 / 知识库召回 ----------------
+
+    @staticmethod
+    def _build_event_shim(origin: str, pending: list[dict]) -> EventShim | None:
+        """用待判定消息构造轻量事件对象，供 LivingMemory 的门禁/作用域解析使用。"""
+        if not pending:
+            return None
+        target = None
+        for p in reversed(pending):
+            text = str(p.get("text") or "").strip()
+            if text and text != "[Empty]":
+                target = p
+                break
+        if target is None:
+            target = pending[-1]
+        return EventShim(
+            origin=origin,
+            sender_id=str(target.get("sender_id") or ""),
+            sender_name=str(target.get("nick") or ""),
+            group_id=str(target.get("group_id") or ""),
+            platform=str(target.get("platform") or ""),
+            platform_id=str(target.get("platform_id") or ""),
+            self_id=str(target.get("self_id") or ""),
+        )
+
+    @staticmethod
+    def _build_recall_query(pending: list[dict]) -> str:
+        """把待判定消息拼成检索 query（去重，最近的消息优先，限长）。"""
+        picked: list[str] = []
+        for p in reversed(pending):
+            text = str(p.get("text") or "").strip()
+            if not text or text == "[Empty]" or text in picked:
+                continue
+            picked.append(text)
+        if not picked:
+            return ""
+        return " | ".join(picked)[:200]
+
+    async def _build_recall_block(
+        self,
+        origin: str,
+        shim: EventShim | None,
+        query: str,
+        persona_id: str,
+        cfg: PluginConfig,
+    ) -> str:
+        """召回长期记忆 + 知识库，整体受 memory.timeout_sec 约束。"""
+        if not cfg.memory.enable or shim is None or not query:
+            return ""
+        try:
+            return await asyncio.wait_for(
+                self._collect_recall(origin, shim, query, persona_id, cfg),
+                timeout=cfg.memory.timeout_sec,
+            )
+        except asyncio.CancelledError:
+            raise
+        except asyncio.TimeoutError:
+            logger.warning(
+                f"self-reply | memory | 召回超时(>{cfg.memory.timeout_sec}s) origin={origin}"
+            )
+            return ""
+        except Exception as e:
+            logger.warning(f"self-reply | memory | 召回失败: {e}")
+            return ""
+
+    async def _collect_recall(
+        self,
+        origin: str,
+        shim: EventShim,
+        query: str,
+        persona_id: str,
+        cfg: PluginConfig,
+    ) -> str:
+        blocks: list[str] = []
+
+        memory_block = await self.memory.recall(
+            shim=shim,
+            query=query,
+            persona_id=persona_id or None,
+            top_k=cfg.memory.top_k,
+            max_chars=cfg.memory.max_chars,
+        )
+        if memory_block:
+            blocks.append(memory_block)
+
+        if cfg.memory.kb_enable:
+            kb_block = await retrieve_kb_block(
+                self.context,
+                origin=origin,
+                query=query,
+                top_k=cfg.memory.kb_top_k,
+                max_chars=cfg.memory.max_chars,
+            )
+            if kb_block:
+                blocks.append(kb_block)
+
+        if not blocks:
+            return ""
+        return truncate_text("\n\n".join(blocks), cfg.memory.max_chars)
+
+    @staticmethod
+    def _append_recall_if_missing(
+        prompt: str, template: str, recall_block: str
+    ) -> str:
+        """模板没写 {recalled_memories} 时，把召回块追加到提示词末尾。
+
+        放在末尾与 LivingMemory 自身的注入策略一致（不破坏前缀缓存），
+        同时兼容"自定义模板未走 format"的分支。
+        """
+        if not recall_block:
+            if RECALL_PLACEHOLDER in prompt:
+                prompt = re.sub(
+                    r"\n{3,}", "\n\n", prompt.replace(RECALL_PLACEHOLDER, "")
+                )
+                return prompt.strip()
+            return prompt
+        if RECALL_PLACEHOLDER in (template or ""):
+            if RECALL_PLACEHOLDER in prompt:
+                return prompt.replace(RECALL_PLACEHOLDER, recall_block)
+            return prompt
+        return f"{prompt}\n\n{recall_block}"
+
+    # ---------------- 会话重置自愈 ----------------
+
+    async def _core_session_fp(self, origin: str) -> tuple[str | None, int] | None:
+        """核心会话指纹 (conversation_id, 历史条数)；读取失败返回 None。"""
+        manager = getattr(self.context, "conversation_manager", None)
+        if manager is None:
+            return None
+        try:
+            cid = await manager.get_curr_conversation_id(origin)
+            if not cid:
+                return (None, 0)
+            conv = await manager.get_conversation(origin, cid)
+            history = getattr(conv, "history", "") if conv else ""
+            try:
+                data = json.loads(history) if history else []
+            except Exception:
+                data = []
+            if not isinstance(data, list):
+                data = []
+            return (str(cid), len(data))
+        except Exception as e:
+            logger.debug(f"self-reply | 读取核心会话指纹失败: {e}")
+            return None
+
+    async def _detect_core_session_reset(
+        self, origin: str, state: OriginState
+    ) -> bool:
+        """检测 /reset 或 /new 造成的核心会话变化，并同步清空插话缓存。
+
+        触发条件（保守，避免误清）：
+          - 会话 id 变化（/new 新建会话）；
+          - 核心会话历史由非空变为空（/reset 清空当前会话）。
+        """
+        fp = await self._core_session_fp(origin)
+        if fp is None:
+            return False
+
+        prev = state.core_session_fp
+        state.core_session_fp = fp
+        if prev is None:
+            return False
+
+        prev_cid, prev_len = prev
+        cid, length = fp
+        if prev_cid and cid and cid != prev_cid:
+            reason = "核心会话已切换（/new）"
+        elif prev_len > 0 and length == 0:
+            reason = "核心会话历史已清空（/reset）"
+        else:
+            return False
+
+        logger.info(
+            f"self-reply | 检测到{reason}，同步清空插话历史缓存: {origin}"
+        )
+        self._drop_state(origin, state)
+        return True
+
+    def _drop_state(self, origin: str, state: OriginState | None = None) -> None:
+        """清理某个会话的运行状态。
+
+        若当前正处于该会话自己的防抖任务里，先摘掉 debounce_task，
+        避免把正在执行的任务取消掉。
+        """
+        current = None
+        try:
+            current = asyncio.current_task()
+        except RuntimeError:
+            current = None
+        if state is not None and current is not None and state.debounce_task is current:
+            state.debounce_task = None
+        self.runtime.cleanup(origin)
 
     def _resolve_provider(self, provider_id: str | None):
         if provider_id:
@@ -708,3 +1001,30 @@ class Main(star.Star):
     async def terminate(self):
         for origin in list(self.runtime.origins.keys()):
             self.runtime.cleanup(origin)
+
+    # ---------------- Hook 4: 监听会话重置 (/reset 或 /new) ----------------
+
+    @filter.after_message_sent(priority=RESET_HOOK_PRIORITY)
+    async def on_after_message_sent(self, event: AstrMessageEvent):
+        """当会话被重置时，同步清空该会话在插话插件中的群聊滑动窗口历史。
+
+        使用最高优先级：AstrBot 的 hook 链在遇到 ``event.is_stopped()`` 时会
+        中断后续 handler，命令事件（/reset、/new）在多数链路上到达这里前
+        就已经是 stopped 状态，只有排在链首才能收到通知。
+        """
+        self._handle_session_reset(event)
+
+    def _handle_session_reset(self, event: AstrMessageEvent) -> bool:
+        """会话重置清理（可单测的纯同步实现），返回是否执行了清理。"""
+        try:
+            flagged = bool(event.get_extra("_clean_ltm_session", False))
+        except Exception:
+            flagged = False
+        if not flagged:
+            return False
+        origin = getattr(event, "unified_msg_origin", "")
+        if not origin:
+            return False
+        logger.info(f"self-reply | 会话已重置，同步清空插话历史缓存: {origin}")
+        self._drop_state(origin, self.runtime.get(origin))
+        return True

@@ -19,6 +19,8 @@ class OriginState:
     msg_fingerprints: dict[str, dict] = field(
         default_factory=dict
     )  # "sender_id\0text" → {ts, wake}，用于折叠同内容重复事件
+    core_session_fp: tuple[str | None, int] | None = None
+    """核心会话指纹 (conversation_id, 历史条数)，用于自愈检测 /reset 与 /new。"""
     debounce_task: asyncio.Task | None = None
     last_reply_ts: float = 0.0
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)

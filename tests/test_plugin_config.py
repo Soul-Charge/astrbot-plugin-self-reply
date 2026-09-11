@@ -4,7 +4,10 @@ import dataclasses
 
 import pytest
 
-from astrbot_plugin_self_reply.judge_utils import DEFAULT_JUDGE_PROMPT
+from astrbot_plugin_self_reply.judge_utils import (
+    DEFAULT_GENERATE_PROMPT,
+    DEFAULT_JUDGE_PROMPT,
+)
 from astrbot_plugin_self_reply.plugin_config import PluginConfig, parse_plugin_config
 
 
@@ -25,11 +28,20 @@ def test_defaults_on_empty_config():
     assert cfg.generate.quote_policy == "judge"
     assert cfg.generate.include_role_tag is True
     assert cfg.generate.include_sender_id is True
+    assert cfg.generate.prompt_template == DEFAULT_GENERATE_PROMPT
     assert cfg.anti_repeat.enable is True
     assert cfg.anti_repeat.similarity_threshold == 0.85
     assert cfg.anti_repeat.max_retries == 1
     assert cfg.anti_repeat.compare_window == 10
     assert cfg.history.max_messages == 50
+    assert cfg.memory.enable is True
+    assert cfg.memory.top_k == 0
+    assert cfg.memory.kb_enable is True
+    assert cfg.memory.kb_top_k == 0
+    assert cfg.memory.max_chars == 3000
+    assert cfg.memory.timeout_sec == 5.0
+    assert cfg.memory.inject_into_judge is True
+    assert cfg.memory.record_bot_reply is False
     assert cfg.whitelist.allowed_origins == []
     assert cfg.global_settings.max_origins == 500
     assert cfg.global_settings.judge_timeout_sec == 45.0
@@ -55,6 +67,18 @@ def test_prompt_template_formatable_with_judge_kwargs():
         history_count=1,
         history_lines="h",
     )
+
+
+def test_generate_prompt_template_formatable():
+    rendered = DEFAULT_GENERATE_PROMPT.format(
+        history_text="hist",
+        targets_str="targets",
+        quote_rule="quote",
+        anti_repeat_instr="anti_repeat",
+    )
+    assert "小盐" in rendered
+    assert "句尾括号" in rendered
+    assert "以括号为准" in rendered
 
 
 def test_tolerant_type_conversion():
@@ -129,3 +153,43 @@ def test_config_is_frozen():
         cfg.enable = False
     with pytest.raises(dataclasses.FrozenInstanceError):
         cfg.trigger.debounce_normal_seconds = 99.0
+
+
+def test_memory_config_parsing_tolerance():
+    cfg = parse_plugin_config(
+        {
+            "memory": {
+                "enable": "false",
+                "top_k": "2",
+                "kb_enable": 0,
+                "kb_top_k": "3.9",
+                "max_chars": "800",
+                "timeout_sec": "2.5",
+                "inject_into_judge": "on",
+                "record_bot_reply": "yes",
+            }
+        }
+    )
+    assert cfg.memory.enable is False
+    assert cfg.memory.top_k == 2
+    assert cfg.memory.kb_enable is False
+    assert cfg.memory.kb_top_k == 3
+    assert cfg.memory.max_chars == 800
+    assert cfg.memory.timeout_sec == 2.5
+    assert cfg.memory.inject_into_judge is True
+    assert cfg.memory.record_bot_reply is True
+
+
+def test_memory_config_invalid_values_fall_back():
+    cfg = parse_plugin_config(
+        {
+            "memory": {
+                "top_k": "abc",
+                "timeout_sec": None,
+                "enable": "not-a-bool",
+            }
+        }
+    )
+    assert cfg.memory.top_k == 0
+    assert cfg.memory.timeout_sec == 5.0
+    assert cfg.memory.enable is True

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
-from .judge_utils import DEFAULT_JUDGE_PROMPT
+from .judge_utils import DEFAULT_GENERATE_PROMPT, DEFAULT_JUDGE_PROMPT
 
 _QUOTE_POLICIES = ("judge", "model", "none")
 
@@ -88,6 +88,7 @@ class GenerateConfig:
     quote_policy: str = "judge"
     include_role_tag: bool = True
     include_sender_id: bool = True
+    prompt_template: str = DEFAULT_GENERATE_PROMPT
 
 
 @dataclass(frozen=True)
@@ -101,6 +102,20 @@ class AntiRepeatConfig:
 @dataclass(frozen=True)
 class HistoryConfig:
     max_messages: int = 50
+
+
+@dataclass(frozen=True)
+class MemoryConfig:
+    """记忆（LivingMemory）与知识库（RAG）召回配置。"""
+
+    enable: bool = True
+    top_k: int = 0
+    kb_enable: bool = True
+    kb_top_k: int = 0
+    max_chars: int = 3000
+    timeout_sec: float = 5.0
+    inject_into_judge: bool = True
+    record_bot_reply: bool = False
 
 
 @dataclass(frozen=True)
@@ -122,6 +137,7 @@ class PluginConfig:
     generate: GenerateConfig = field(default_factory=GenerateConfig)
     anti_repeat: AntiRepeatConfig = field(default_factory=AntiRepeatConfig)
     history: HistoryConfig = field(default_factory=HistoryConfig)
+    memory: MemoryConfig = field(default_factory=MemoryConfig)
     whitelist: WhitelistConfig = field(default_factory=WhitelistConfig)
     global_settings: GlobalSettings = field(default_factory=GlobalSettings)
     enable: bool = False
@@ -142,6 +158,7 @@ def parse_plugin_config(raw: dict) -> PluginConfig:
     generate_raw = _as_dict(raw.get("generate"))
     anti_raw = _as_dict(raw.get("anti_repeat"))
     history_raw = _as_dict(raw.get("history"))
+    memory_raw = _as_dict(raw.get("memory"))
     whitelist_raw = _as_dict(raw.get("whitelist"))
     global_raw = _as_dict(raw.get("global_settings"))
 
@@ -177,6 +194,7 @@ def parse_plugin_config(raw: dict) -> PluginConfig:
             quote_policy=_sanitize_quote_policy(generate_raw.get("quote_policy", "judge")),
             include_role_tag=_to_bool(generate_raw.get("include_role_tag"), True),
             include_sender_id=_to_bool(generate_raw.get("include_sender_id"), True),
+            prompt_template=str(generate_raw.get("prompt_template") or DEFAULT_GENERATE_PROMPT),
         ),
         anti_repeat=AntiRepeatConfig(
             enable=_to_bool(anti_raw.get("enable"), True),
@@ -185,6 +203,16 @@ def parse_plugin_config(raw: dict) -> PluginConfig:
             compare_window=_to_int(anti_raw.get("compare_window"), 10),
         ),
         history=HistoryConfig(max_messages=_to_int(history_raw.get("max_messages"), 50)),
+        memory=MemoryConfig(
+            enable=_to_bool(memory_raw.get("enable"), True),
+            top_k=_to_int(memory_raw.get("top_k"), 0),
+            kb_enable=_to_bool(memory_raw.get("kb_enable"), True),
+            kb_top_k=_to_int(memory_raw.get("kb_top_k"), 0),
+            max_chars=_to_int(memory_raw.get("max_chars"), 3000),
+            timeout_sec=_to_float(memory_raw.get("timeout_sec"), 5.0),
+            inject_into_judge=_to_bool(memory_raw.get("inject_into_judge"), True),
+            record_bot_reply=_to_bool(memory_raw.get("record_bot_reply"), False),
+        ),
         whitelist=WhitelistConfig(
             allowed_origins=_to_list(whitelist_raw.get("allowed_origins"), [])
         ),

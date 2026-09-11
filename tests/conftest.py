@@ -1,12 +1,20 @@
 """pytest 公共配置：包别名 + astrbot 桩（仅在运行环境没有 astrbot 包时安装）。"""
 
 import logging
+import os
 import sys
+import tempfile
 import types
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 PLUGINS_DIR = Path(__file__).resolve().parents[2]
+
+# AstrBot 以 CWD 作为根目录并据此创建 <root>/data（配置/数据库/临时目录）。
+# 测试进程会 import 真实 astrbot 包，若不重定向就会在插件仓库里生成 data/ 垃圾目录。
+os.environ.setdefault(
+    "ASTRBOT_ROOT", tempfile.mkdtemp(prefix="astrbot-self-reply-tests-")
+)
 
 for _candidate in (PROJECT_ROOT, PLUGINS_DIR):
     if str(_candidate) not in sys.path:

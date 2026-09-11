@@ -59,7 +59,7 @@
             },
             "prompt_template": {
                 "description": "判定提示词模板",
-                "hint": "可用占位符：{persona_name} {persona_mask} {pending_count} {pending_msgs} {history_count} {history_lines}。JSON 示例行的大括号需写成 {{ }} 转义。",
+                "hint": "可用占位符：{persona_name} {persona_mask} {pending_count} {pending_msgs} {history_count} {history_lines} {recalled_memories}。JSON 示例行的大括号需写成 {{ }} 转义。",
                 "type": "text",
                 "default": "你当前的人格是:{persona_name}\n人格设定:{persona_mask}\n\n以下群聊最近 {pending_count} 条待判定消息:\n{pending_msgs}\n\n(历史上下文最近 {history_count} 条,已回复的已标为 [replied]):\n{history_lines}\n\n请以你的人格判断是否应该主动回复这些消息,并给出至多 1 个目标 msg_id。\n\n【重要：这是多人群聊，不是私聊】\n- 不是所有消息都发给你。别人 @ 其他群友、引用/回复其他群友的消息，通常是在和其他人说话，默认不要插话。\n- 只有消息 @你、回复/引用你、或明确提到你/你的名字时，才算“发给你”。\n- 如果待判定消息是其他群友之间的连续对话（尤其是一对一闲聊），请 SKIP。\n- 只有当你有非常自然、值得开口的理由（例如话题明显与你有关、你能自然接住梗且不会打扰别人）时，才 REPLY。\n- 普通群聊发言没有明确收件人时，可以按人格判断是否值得主动接话，但不要每条都回。\n\n{{\"decision\":\"reply\",\"target_ids\":[\"msgid\"],\"reason\":\"...\"}}\n{{\"decision\":\"skip\",\"reason\":\"...\"}}\n只输出 JSON,不要额外文字。"
             }
@@ -74,7 +74,7 @@
                 "hint": "用于生成回复内容的提供商，可指定视觉模型。留空使用当前默认提供商。",
                 "type": "string",
                 "_special": "select_provider",
-                "default": "deepseek-vision/deepseek-v4-flash-vision-exp"
+                "default": "deepseek/deepseek-v4-flash-vision-exp"
             },
             "attach_recent_images": {
                 "description": "附带近期图片数",
@@ -100,6 +100,12 @@
                 "hint": "在历史消息格式中写入发送者用户 ID。",
                 "type": "bool",
                 "default": true
+            },
+            "prompt_template": {
+                "description": "生成提示词模板",
+                "hint": "用于引导主动插话回复内容。可直接填写指引，或使用 {history_text} {targets_str} {quote_rule} {anti_repeat_instr} {recalled_memories} 占位符自定义完整结构；未写 {recalled_memories} 时召回内容会自动追加到提示词末尾。",
+                "type": "text",
+                "default": "你正在以「小盐」的软萌猫娘身份参与群聊，对群友的消息生成一句插话回应。\n\n群聊历史:\n{history_text}\n\n你决定针对以下消息进行插话回应:\n{targets_str}\n\n1. 先判断对方的真实情绪，再决定回应方式：\n   - 句尾括号（如（悲（哭（恼（乐）是对方的真实情绪注脚，以括号为准；\n   - 对方难过、心疼、诉苦、自嘲倒霉 → 软软安慰、摸摸、陪ta叹气；\n   - 对方明确在开心、整活、玩梗 → 才跟着调侃吐槽；\n   - 拿不准 → 温和中性回应，不要反讽、不要倒打一耙。\n2. 回应必须忠于对方实际表达的意思，不臆测、不捏造对方没有表现出的态度（例如对方在诉苦时，禁止说成对方在笑/在得意）。\n3. 一两句话，口语化，不用列表、不用格式化排版，符合群聊闲聊氛围。\n不要以为所有消息都是对你说的。只有在有明确证据时才把自己当话题。直接输出回复内容，不要额外解释。\n{quote_rule}\n{anti_repeat_instr}"
             }
         }
     },
@@ -141,6 +147,60 @@
                 "hint": "每个会话保留的最大群聊历史行数，超出后淘汰最旧记录并回收其图片注册。",
                 "type": "int",
                 "default": 50
+            }
+        }
+    },
+    "memory": {
+        "description": "记忆与知识库",
+        "type": "object",
+        "items": {
+            "enable": {
+                "description": "启用记忆召回",
+                "hint": "生成/判定前检索 astrbot_plugin_livingmemory 的长期记忆，并注入提示词；插件未安装时自动跳过。",
+                "type": "bool",
+                "default": true
+            },
+            "top_k": {
+                "description": "记忆召回条数",
+                "hint": "0 = 跟随 LivingMemory 的 recall_engine.top_k。",
+                "type": "int",
+                "default": 0
+            },
+            "kb_enable": {
+                "description": "启用知识库检索",
+                "hint": "检索 AstrBot 知识库（kb_names），结果与记忆一起注入提示词。",
+                "type": "bool",
+                "default": true
+            },
+            "kb_top_k": {
+                "description": "知识库返回条数",
+                "hint": "0 = 跟随 AstrBot 全局 kb_final_top_k（并保留会话级 kb_config）。",
+                "type": "int",
+                "default": 0
+            },
+            "max_chars": {
+                "description": "召回块最大字符数",
+                "hint": "记忆 + 知识库注入文本的总长度上限，超出截断，避免挤掉群聊上下文。",
+                "type": "int",
+                "default": 3000
+            },
+            "timeout_sec": {
+                "description": "召回超时（秒）",
+                "hint": "记忆与知识库检索的整体超时，超时则本轮不注入，保证插话不被拖慢。",
+                "type": "float",
+                "default": 5.0
+            },
+            "inject_into_judge": {
+                "description": "判定阶段注入召回",
+                "hint": "开启后 judge 也能看到召回内容，便于判断话题是否与 bot 的记忆相关。",
+                "type": "bool",
+                "default": true
+            },
+            "record_bot_reply": {
+                "description": "回复写回长期记忆",
+                "hint": "把自主回复写入 LivingMemory 的会话流，使纯插话群聊也能达到反思/总结阈值并沉淀为长期记忆。",
+                "type": "bool",
+                "default": false
             }
         }
     },

@@ -239,3 +239,64 @@ if hasattr(self.context, "kb_manager") and self.context.kb_manager:
 | **群聊重置后“还记得”** | ⚠️ 内存未清 | LivingMemory 终止了事件传播，`self-reply` 内部会话历史缓存未被 reset 成功 |
 | **群聊消息私聊读不到** | ⌛ 两级架构 | 仅停留在 `conversations.db` 未达到 15 轮反思提炼，且在 17:52 被 reset 清除 |
 | **监控群被拦仍有记录** | 📦 历史与旁路 | 2026-09-09 部署前已存 671 条历史，阻断后 RespondStage 仍触发后置钩子感知 |
+
+---
+
+## 七、 修复实施记录（2026-09-11）
+
+按第五节方案 1 / 方案 2 完成代码改造，并追加了场景 3 的重置可靠性修复。代码位于 `astrbot_plugin_self_reply`，测试基线 68 passed → 120 passed。
+
+### 7.1 根因勘误（场景 3）
+
+原第三节 3.3 判定“LivingMemory 触发重置后 `stop_event` 导致 `self-reply` 未被调用”，与日志不符。复核 `docker logs astrbot` 17:52:13 的重置事件：
+
+```text
+[17:52:13.775] hook(OnAfterMessageSentEvent) -> astrbot_plugin_livingmemory - handle_session_reset
+[17:52:13.880] hook(OnAfterMessageSentEvent) -> meme_manager - after_message_sent
+[17:52:13.880] hook(OnAfterMessageSentEvent) -> astrbot - after_message_sent
+```
+
+三个钩子全部执行完毕，**没有任何一条“终止了事件传播”**，即当次事件并未被 stop；且整段日志中 `astrbot_plugin_self_reply - on_after_message_sent` 出现 0 次（同一时刻 `self-reply - on_group_message` 正常执行），说明当次运行的插件版本尚未注册该钩子（插件在 21:20:51 才被重载为含钩子的版本）。
+
+但机制性隐患真实存在，且被 20:56 的日志证实：
+
+```text
+[20:56:51.868] hook(OnAfterMessageSentEvent) -> meme_manager - after_message_sent
+[20:56:51.869] meme_manager - after_message_sent 终止了事件传播。
+```
+
+`astrbot/core/pipeline/context_utils.py:call_event_hook()` 在每个 handler 之后只要 `event.is_stopped()` 为真就 `return True` 提前结束整条链；被 `group_filter` 拦截、被 `waking_check` 判定不唤醒等场景，事件在进入 RespondStage 前已是 stopped 状态，于是**只有排在链首的钩子能收到通知**。`star_handlers_registry` 按 `-priority` 稳定排序（默认 priority=0，后加载者靠后），self-reply 作为最后加载的插件排在最末。
+
+### 7.2 代码改动
+
+| 文件 | 改动 |
+|---|---|
+| `memory_bridge.py` | 新增。经 `astrbot.core.star.star.star_registry` 定位 LivingMemory 实例，复用其 `core.memory_scope`（白名单 / 作用域）、`core.utils.format_memories_for_injection`（格式化）与 `config_manager`（top_k / 过滤开关）调用 `memory_engine.search_memories()`；用 `EventShim` 替代已结束的真实事件；可选 `record_bot_reply` 调用其 `handle_memory_reflection()` |
+| `kb_bridge.py` | 新增。优先复用官方入口 `astrbot.core.tools.knowledge_base_tools.retrieve_knowledge_base`（含会话级 `kb_config`、全局 `kb_names`、空库短路），不可用时退回 `context.kb_manager.retrieve()` |
+| `main.py` | 判定/生成前统一召回（`_build_recall_block` / `_collect_recall`），支持 `{recalled_memories}` 占位符与自动尾部追加；重置钩子改为 `priority=sys.maxsize`（`RESET_HOOK_PRIORITY`）；新增会话指纹自愈 `_detect_core_session_reset`（`/new` 换 id、`/reset` 历史清空）；新增在途守卫（生成期间被重置则丢弃本轮回复）；`_resolve_persona` 同时返回 persona_id 供记忆过滤 |
+| `plugin_config.py` / `_conf_schema.json` | 新增 `memory` 配置组：`enable` / `top_k` / `kb_enable` / `kb_top_k` / `max_chars`(3000) / `timeout_sec`(5.0) / `inject_into_judge`(true) / `record_bot_reply`(false) |
+| `runtime_state.py` | `OriginState` 新增 `core_session_fp`（(conversation_id, 历史条数) 指纹） |
+| `tests/` | 新增 `test_memory_bridge.py`(18)、`test_kb_bridge.py`(10)、`test_main_reset.py`(22)，并补充 `test_plugin_config.py` 的 memory 组断言 |
+
+### 7.3 对应的场景结论
+
+| 场景 | 修复后 |
+|---|---|
+| 1. 群聊主动接话“失忆” | 判定与生成 prompt 都会带上 LivingMemory 召回 + 知识库检索块，`三X/叁X` 之类实体可由记忆与档案关联，不再裸判“这个词不存在” |
+| 3. 重置后仍记得 | 钩子提到链首必被执行；另有指纹自愈与在途守卫兜底 |
+| 4. 群聊内容未沉淀 | 可选开启 `memory.record_bot_reply` 后，自主回复会写回 LivingMemory 会话流，使纯插话群聊也能累积到反思阈值并提炼为长期记忆（默认关闭，需手动打开） |
+| 5. 监控群历史残留 | 属历史数据与上游事件语义，不在本插件范围内；`conversations.db` 中 671 条历史如需清理另行授权操作 |
+| 方案 3 实体别名 | 属知识库数据补充（`人际关系基础设定` 中补 `user：又称三X、叁X、叁X酱、姐X`），建议在 WebUI 手动维护，未做代码改动 |
+
+### 7.4 验证
+
+- 单元测试：容器内 `python -m pytest /AstrBot/data/plugins/astrbot_plugin_self_reply/tests -q` → **120 passed**（含降级、超时、截断、门禁、指纹、在途守卫等用例）。
+- 真实接口联调（独立进程，不触网）：用真实 `astrbot_plugin_livingmemory` 模块与真实 `astrbot_plugin_livingmemory_config.json` 校验 —— 模块定位成功、`is_event_memory_allowed(cm, shim)=True`、`resolve_memory_scope(cm, shim)=None`（`use_session_filtering=false`）、`recall_engine.top_k=3` 读取正常、`format_memories_for_injection` 复用成功。
+- 线上验证（重载插件后）：见 7.5。
+
+### 7.5 线上验证清单（重载插件后执行）
+
+1. 群 400000000 发不带 `@` 的记忆相关消息 → 日志出现 `self-reply | memory | 召回 N 条记忆 ...`，回复能认出“叁X/姐X”。
+2. `@小盐 reset` 后紧接旧话题 → 日志出现 `self-reply | 会话已重置，同步清空插话历史缓存`，回复不再复述重置前细节。
+3. `docker logs astrbot | grep OnAfterMessageSentEvent` → `astrbot_plugin_self_reply - on_after_message_sent` 现在排在链首。
+

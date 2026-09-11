@@ -38,6 +38,8 @@
 - **结构化判定**：judge 输出 `{"decision":"reply|skip","target_ids":[...],"reason":"..."}`，兼容裸 `REPLY/SKIP` 文本。
 - **按需引用**：默认不引用、直接在群里说话；当目标消息是问句时，`quote_policy=judge` 会自动补引用标签，模型自己写的引用也会校验 msg_id 是否存在于近期历史，防幻觉。
 - **防重复**：生成前注入 bot 近期回复；生成后与最近 N 条做相似度终检，重复则重试或放弃。
+- **记忆与知识库联动**：判定/生成前从 `astrbot_plugin_livingmemory` 召回长期记忆、从 AstrBot 知识库召回相关知识，拼成"相关背景"块注入提示词；插件缺失、未初始化、超时或检索报错时自动降级为空块，不影响插话。自定义提示词可用 `{recalled_memories}` 占位符控制位置，未写则自动追加到提示词末尾。
+- **重置可靠清理**：`/reset`、`/new` 之后立即清空该会话的滑动窗口历史、待判定队列、图片注册与已回复记账；钩子以最高优先级注册（命令事件常常已被 stop，排在链尾的钩子收不到通知），另有会话指纹自愈与"生成期间被重置则丢弃本轮回复"双重兜底。
 - **图片上下文**：近期群图注册表，生成时最多附带 N 张原图（视觉模型）。
 - **容量治理**：历史 50 条/会话、已回复注册表 200 条、会话状态 LRU 500 个，插件卸载时清理防抖任务。
 
@@ -64,6 +66,14 @@
 | | max_retries | 1 | 重复重试次数 |
 | | compare_window | 10 | 比较窗口条数 |
 | history | max_messages | 50 | 每会话历史上限 |
+| memory | enable | true | 启用记忆 + 知识库召回 |
+| | top_k | 0 | 记忆召回条数，0 = 跟随 LivingMemory `recall_engine.top_k` |
+| | kb_enable | true | 启用 AstrBot 知识库检索 |
+| | kb_top_k | 0 | 知识库返回条数，0 = 跟随全局 `kb_final_top_k`（保留会话级 kb_config） |
+| | max_chars | 3000 | 召回块总字符上限，超出截断 |
+| | timeout_sec | 5.0 | 召回整体超时，超时本轮不注入 |
+| | inject_into_judge | true | 判定阶段也注入召回内容 |
+| | record_bot_reply | false | 把自主回复写回 LivingMemory，使纯插话群聊也能触发反思总结 |
 | whitelist | allowed_origins | [] | unified_msg_origin 或群号白名单，留空全群生效 |
 | global_settings | max_origins | 500 | 会话状态 LRU 上限 |
 | | judge_timeout_sec | 45.0 | 判定超时 |
@@ -74,6 +84,7 @@
 - `astrbot_plugin_astrbot_enhance_mode` 已在 WebUI 禁用（避免双判定）。
 - AstrBot 内置 `active_reply.enable` / `group_icl_enable` 关闭。
 - 判定/生成所填 provider_id 已在 AstrBot 中配置。
+- 记忆召回依赖 `astrbot_plugin_livingmemory`（可选）：未安装/未初始化时自动跳过，只保留知识库召回；知识库召回依赖 AstrBot `kb_names` 配置（可选）。
 - Python ≥ 3.10，AstrBot v4.24.5。
 
 ## 使用示例
@@ -95,4 +106,4 @@ python -m pytest /AstrBot/data/plugins/astrbot_plugin_self_reply/tests -q
 python -m pytest tests -q
 ```
 
-覆盖范围：配置解析容错、标签/引用/拒答处理、图片 URL/base64 解析、回复记账（冷却/已回复/相似度）、判定输出解析（JSON/容错）。
+覆盖范围：配置解析容错（含 `memory` 组）、标签/引用/拒答处理、图片 URL/base64 解析、回复记账（冷却/已回复/相似度）、判定输出解析（JSON/容错）、记忆桥（LivingMemory 发现/门禁/作用域/截断/写回与降级）、知识库桥（官方入口复用/本地兜底/降级）、会话重置清理（钩子优先级/指纹自愈/在途守卫）与召回注入。
