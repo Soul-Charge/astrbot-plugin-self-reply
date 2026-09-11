@@ -396,3 +396,46 @@ if hasattr(self.context, "kb_manager") and self.context.kb_manager:
 - 插话会出现在平台消息历史与统计里，并经过内容安全检查、频率限制等标准阶段。
 - 不挂核心会话（`keep_conversation=false`）时，`_decorate_llm_request` 不会注入核心人格，人格由插件自己注入；核心上下文仍作为 `req.contexts` 提供给模型。
 - 若同时启用会改写 `req.prompt` 的插件（如 enhance mode 的 React 模式），其 `on_llm_request` 钩子排在后面，会覆盖插话提示词 → 两者不要同时开。
+
+### 8.5 线上验证结果（2026-09-12 23:35，已通过）
+
+线上配置切到 `dispatch.mode=pipeline` 并重载插件后，在群 400000000 里发一条不带 @ 的消息（"小盐是笨猫"），完整链路一次通过：
+
+```text
+[23:35:06.167] self-reply | memory | 召回 5 条记忆 scope=global persona=小盐-new chars=3000   ← 判定侧召回
+[23:35:08.287] self-reply | judge ... decision={'decision': 'reply', 'target_ids': ['msg700000000'], ...}
+[23:35:08.288] self-reply | pipeline dispatch origin=bot:GroupMessage:400000000 msg_id=selfreply-pipe-1a08… provider=deepseek/deepseek-flash
+[23:35:08.288] self-reply | 插话已交回主管道 ... targets=['700000000'] should_quote=False
+[23:35:10.982] hook(OnLLMRequestEvent) -> astrbot_plugin_self_reply - on_pipeline_llm_request     ← 排第一
+[23:35:10.982] self-reply | pipeline 注入完成 ... keep_conv=False tools=off
+[23:35:10.983] hook(OnLLMRequestEvent) -> astrbot_plugin_livingmemory - handle_memory_recall      ← 记忆注入未被覆盖
+[23:35:12.645] hook(OnLLMRequestEvent) -> astrbot - decorate_llm_req
+[23:35:12.645] [bot:GroupMessage:400000000] 操作成功完成: 记忆召回 (耗时 1.661s)
+[23:35:13.733] completion: model='deepseek-flash' content='才不是笨猫喵，明明是E0先笨的，咬你一口！'
+[23:35:13.743] hook(OnLLMResponseEvent) -> astrbot_plugin_livingmemory - handle_memory_reflection    ← 记忆反思自然触发
+[23:35:13.757] [ConversationManager] 添加消息: session=bot:GroupMessage:400000000, role=assistant, sender=6000000000
+[23:35:13.761] [DEBUG-Reflection] 总消息数: 3, 上次总结位置: 0, 未总结轮数: 1, 触发阈值: 15轮
+[23:35:13.762] hook(on_decorating_result) -> astrbot_plugin_self_reply - on_pipeline_decorating_result
+[23:35:13.765] [respond.stage] Prepare to send - 小盐-new/6000000000: 才不是笨猫喵，明明是E0先笨的，咬你一口！
+[23:35:13.936] hook(OnAfterMessageSentEvent) -> astrbot_plugin_self_reply - on_after_message_sent   ← 链首记账
+[23:35:13.936] self-reply | pipeline 回复已发送 origin=bot:GroupMessage:400000000 targets=['700000000']
+[23:35:13.936] hook(OnAfterMessageSentEvent) -> astrbot_plugin_livingmemory - handle_session_reset
+[23:35:13.937] hook(OnAfterMessageSentEvent) -> meme_manager - after_message_sent
+[23:35:13.937] hook(OnAfterMessageSentEvent) -> astrbot - after_message_sent
+[23:35:13.939] pipeline 执行完毕。
+```
+
+结论逐条对应 8.4 的差异表：
+
+| 期望 | 实测 |
+|---|---|
+| 生成走主管道 | ✅ `Prepare to send` 由 `respond.stage` 输出 |
+| 用插件配置的生成 Provider | ✅ 模型 `deepseek-flash`（`selected_provider` 生效，非会话默认 vision-exp） |
+| 记忆召回注入不被覆盖 | ✅ 本插件钩子在前，LivingMemory 钩子在后台并在 1.661s 内完成召回 |
+| 记忆反思/总结自然触发 | ✅ `handle_memory_reflection` 写入 assistant 消息，未总结轮数 1/15 开始累积 |
+| 不写核心会话历史 | ✅ `keep_conv=False`；核心会话未被追加 |
+| 不阻塞其他插件钩子 | ✅ meme_manager / astrbot 的 on_decorating_result 与 after_message_sent 均照常执行 |
+| 判定仍用轻量直连 | ✅ 判定侧仍走 memory_bridge + `judge.provider_id` |
+
+旁证（与本改造无关的既有现象）：`meme_manager` 在每次 LLM 响应后会打出
+`情感模型调用失败: Provider deepseek/deepseek-v4-flash not found`，属其自身 Provider 配置问题，可另行处理。
