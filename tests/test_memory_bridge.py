@@ -11,6 +11,7 @@ from astrbot_plugin_self_reply.memory_bridge import (
     MAX_ITEM_CHARS,
     EventShim,
     MemoryBridge,
+    truncate_block,
     truncate_text,
 )
 
@@ -287,6 +288,23 @@ def test_truncate_text_appends_suffix():
     out = truncate_text("x" * 100, 20)
     assert out.endswith("（已截断）")
     assert len(out) == 20
+
+
+def test_truncate_block_prefers_entry_boundary():
+    block = "记忆 #1\n" + "甲" * 40 + "\n\n记忆 #2\n" + "乙" * 40
+    out = truncate_block(block, 60)
+    assert out.endswith("（已截断）")
+    assert "记忆 #1" in out
+    assert "乙" not in out  # 第二条整条被丢弃，而不是切一半
+    assert len(out) <= 60
+
+
+def test_truncate_block_falls_back_when_boundary_too_early():
+    block = "甲\n\n" + "乙" * 100
+    out = truncate_block(block, 50)
+    assert out.endswith("（已截断）")
+    assert len(out) == 50  # 边界太靠前（<50%）时不按边界切
+    assert "乙" in out
 
 
 def test_recall_truncates_long_memory_content(monkeypatch):

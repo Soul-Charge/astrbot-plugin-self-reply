@@ -393,6 +393,107 @@ async def _empty():
     return ""
 
 
+def _plugin_with_recall(config_extra=None, judge_texts=None, gen_texts=None):
+    """构造一个带自定义 memory 配置的插件（用于召回超时/并发用例）。"""
+    judge = FakeProvider(judge_texts or [_judge_reply()])
+    gen = FakeProvider(gen_texts or ["回复"])
+    plugin = _make_plugin(judge, gen)
+    raw = {
+        "enable": True,
+        "judge": {"provider_id": "judge-provider"},
+        "generate": {"provider_id": "gen-provider"},
+        "memory": config_extra or {},
+    }
+    plugin._config = main_mod.parse_plugin_config(raw)
+    _seed_pending(plugin)
+    return plugin, judge, gen
+
+
+def test_kb_timeout_keeps_memory_block(monkeypatch):
+    """知识库慢/超时不能把已经检索到的记忆一起丢掉。"""
+    plugin, judge, gen = _plugin_with_recall({"timeout_sec": 0.2})
+    _record_sends(monkeypatch)
+
+    async def fast_memory(**kwargs):
+        return "【相关长期记忆】user是窝的姐X"
+
+    async def slow_kb(*args, **kwargs):
+        await asyncio.sleep(1.0)
+        return "【知识库检索结果】不该出现"
+
+    monkeypatch.setattr(plugin.memory, "recall", fast_memory)
+    monkeypatch.setattr(main_mod, "retrieve_kb_block", slow_kb)
+
+    asyncio.run(plugin._handle_pending(ORIGIN))
+
+    assert "user是窝的姐X" in judge.prompts[0]
+    assert "user是窝的姐X" in gen.prompts[0]
+    assert "不该出现" not in gen.prompts[0]
+
+
+def test_memory_timeout_keeps_kb_block(monkeypatch):
+    """记忆慢/超时也不能影响知识库结果。"""
+    plugin, judge, gen = _plugin_with_recall({"timeout_sec": 0.2})
+    _record_sends(monkeypatch)
+
+    async def slow_memory(**kwargs):
+        await asyncio.sleep(1.0)
+        return "【相关长期记忆】不该出现"
+
+    async def fast_kb(*args, **kwargs):
+        return "【知识库检索结果】user，又称三X。"
+
+    monkeypatch.setattr(plugin.memory, "recall", slow_memory)
+    monkeypatch.setattr(main_mod, "retrieve_kb_block", fast_kb)
+
+    asyncio.run(plugin._handle_pending(ORIGIN))
+
+    assert "user，又称三X" in gen.prompts[0]
+    assert "不该出现" not in gen.prompts[0]
+
+
+def test_recall_sources_run_concurrently(monkeypatch):
+    """两个来源并发执行：各自耗时接近超时上限时，仍能同时拿到结果。"""
+    plugin, judge, gen = _plugin_with_recall({"timeout_sec": 0.4})
+    _record_sends(monkeypatch)
+
+    async def memory_like(**kwargs):
+        await asyncio.sleep(0.25)
+        return "【相关长期记忆】记忆块"
+
+    async def kb_like(*args, **kwargs):
+        await asyncio.sleep(0.25)
+        return "【知识库检索结果】知识块"
+
+    monkeypatch.setattr(plugin.memory, "recall", memory_like)
+    monkeypatch.setattr(main_mod, "retrieve_kb_block", kb_like)
+
+    asyncio.run(plugin._handle_pending(ORIGIN))
+
+    # 串行执行的话第二个必然超时（0.25+0.25 > 0.4）
+    assert "记忆块" in gen.prompts[0]
+    assert "知识块" in gen.prompts[0]
+
+
+def test_recall_block_carries_usage_hint(monkeypatch):
+    """召回块首必须带"同一实体不同写法"的使用说明。"""
+    plugin, judge, gen = _plugin_with_recall()
+    _record_sends(monkeypatch)
+
+    async def memory_like(**kwargs):
+        return "【相关长期记忆】user是窝的姐X"
+
+    monkeypatch.setattr(plugin.memory, "recall", memory_like)
+    monkeypatch.setattr(main_mod, "retrieve_kb_block", lambda *a, **k: _empty())
+
+    asyncio.run(plugin._handle_pending(ORIGIN))
+
+    from astrbot_plugin_self_reply.main import RECALL_USAGE_HINT
+
+    assert RECALL_USAGE_HINT in gen.prompts[0]
+    assert gen.prompts[0].index(RECALL_USAGE_HINT) < gen.prompts[0].index("user")
+
+
 def _sent_text(chain_obj) -> str:
     parts = []
     for comp in getattr(chain_obj, "chain", None) or []:

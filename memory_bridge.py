@@ -64,6 +64,22 @@ def truncate_text(text: str, max_chars: int) -> str:
     return text[:keep] + TRUNCATED_SUFFIX
 
 
+def truncate_block(text: str, max_chars: int) -> str:
+    """按块截断：优先在条目边界（空行）处断开，避免半句话被腰斩。
+
+    只有在能保留一半以上内容时才按边界切，否则退化为普通截断。
+    """
+    text = text or ""
+    if max_chars <= 0 or len(text) <= max_chars:
+        return text
+    keep = max(max_chars - len(TRUNCATED_SUFFIX), 1)
+    head = text[:keep]
+    cut = head.rfind("\n\n")
+    if cut >= keep // 2:
+        head = head[:cut]
+    return head.rstrip() + TRUNCATED_SUFFIX
+
+
 class EventShim:
     """LivingMemory 工具函数需要的最小只读事件接口。
 

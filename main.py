@@ -19,7 +19,7 @@ from astrbot.core.star.star_tools import StarTools
 from .image_resolver import resolve
 from .judge_utils import DEFAULT_GENERATE_PROMPT, parse_judge_output
 from .kb_bridge import retrieve_kb_block
-from .memory_bridge import EventShim, MemoryBridge, truncate_text
+from .memory_bridge import EventShim, MemoryBridge, truncate_block
 from .plugin_config import PluginConfig, parse_plugin_config
 from .reply_tracker import ReplyTracker
 from .runtime_state import OriginState, RuntimeState
@@ -41,6 +41,14 @@ RESET_HOOK_PRIORITY = sys.maxsize
 
 # 召回内容注入占位符
 RECALL_PLACEHOLDER = "{recalled_memories}"
+
+# 召回块的使用提示（放在块首，避免被 max_chars 截断时丢失）
+RECALL_USAGE_HINT = (
+    "【参考信息使用说明】以下是从长期记忆与知识库检索到的相关内容，"
+    "同一个人的不同写法（繁体/简体、全名/简称/别称/昵称）请视为同一个实体；"
+    "记忆里已经写明的关系与事实请直接采用，不要回答“不认识”“不知道是谁”；"
+    "若确实与本轮无关，忽略即可，也不要据此编造。"
+)
 
 # 识别“值得引用回复”的特别问句，避免所有自主回复都变成引用模式
 _QUESTION_RE = re.compile(
@@ -830,21 +838,17 @@ class Main(star.Star):
         persona_id: str,
         cfg: PluginConfig,
     ) -> str:
-        """召回长期记忆 + 知识库，整体受 memory.timeout_sec 约束。"""
+        """召回长期记忆 + 知识库。
+
+        两个来源**并发执行、各自独立超时**：任何一个慢/失败都不影响另一个，
+        避免"知识库超时把已经检索到的记忆一起丢掉"。
+        """
         if not cfg.memory.enable or shim is None or not query:
             return ""
         try:
-            return await asyncio.wait_for(
-                self._collect_recall(origin, shim, query, persona_id, cfg),
-                timeout=cfg.memory.timeout_sec,
-            )
+            return await self._collect_recall(origin, shim, query, persona_id, cfg)
         except asyncio.CancelledError:
             raise
-        except asyncio.TimeoutError:
-            logger.warning(
-                f"self-reply | memory | 召回超时(>{cfg.memory.timeout_sec}s) origin={origin}"
-            )
-            return ""
         except Exception as e:
             logger.warning(f"self-reply | memory | 召回失败: {e}")
             return ""
@@ -857,32 +861,74 @@ class Main(star.Star):
         persona_id: str,
         cfg: PluginConfig,
     ) -> str:
-        blocks: list[str] = []
-
-        memory_block = await self.memory.recall(
-            shim=shim,
-            query=query,
-            persona_id=persona_id or None,
-            top_k=cfg.memory.top_k,
-            max_chars=cfg.memory.max_chars,
-        )
-        if memory_block:
-            blocks.append(memory_block)
-
+        jobs = [
+            self._recall_memory_block(shim, query, persona_id, cfg),
+        ]
         if cfg.memory.kb_enable:
-            kb_block = await retrieve_kb_block(
-                self.context,
-                origin=origin,
-                query=query,
-                top_k=cfg.memory.kb_top_k,
-                max_chars=cfg.memory.max_chars,
-            )
-            if kb_block:
-                blocks.append(kb_block)
+            jobs.append(self._recall_kb_block(origin, query, cfg))
+
+        results = await asyncio.gather(*jobs, return_exceptions=True)
+
+        blocks: list[str] = []
+        for item in results:
+            if isinstance(item, BaseException):
+                logger.warning(f"self-reply | memory | 召回子任务异常: {item}")
+                continue
+            if item:
+                blocks.append(str(item))
 
         if not blocks:
             return ""
-        return truncate_text("\n\n".join(blocks), cfg.memory.max_chars)
+        # 使用提示放在最前面，保证被截断时也不会丢；截断优先落在条目边界
+        return truncate_block(
+            RECALL_USAGE_HINT + "\n\n" + "\n\n".join(blocks), cfg.memory.max_chars
+        )
+
+    async def _recall_memory_block(
+        self, shim: EventShim, query: str, persona_id: str, cfg: PluginConfig
+    ) -> str:
+        timeout = cfg.memory.timeout_sec
+        try:
+            return await asyncio.wait_for(
+                self.memory.recall(
+                    shim=shim,
+                    query=query,
+                    persona_id=persona_id or None,
+                    top_k=cfg.memory.top_k,
+                    max_chars=cfg.memory.max_chars,
+                ),
+                timeout=timeout,
+            )
+        except asyncio.CancelledError:
+            raise
+        except asyncio.TimeoutError:
+            logger.warning(f"self-reply | memory | 记忆召回超时(>{timeout}s)")
+            return ""
+        except Exception as e:
+            logger.warning(f"self-reply | memory | 记忆召回失败: {e}")
+            return ""
+
+    async def _recall_kb_block(self, origin: str, query: str, cfg: PluginConfig) -> str:
+        timeout = cfg.memory.timeout_sec
+        try:
+            return await asyncio.wait_for(
+                retrieve_kb_block(
+                    self.context,
+                    origin=origin,
+                    query=query,
+                    top_k=cfg.memory.kb_top_k,
+                    max_chars=cfg.memory.max_chars,
+                ),
+                timeout=timeout,
+            )
+        except asyncio.CancelledError:
+            raise
+        except asyncio.TimeoutError:
+            logger.warning(f"self-reply | memory | 知识库检索超时(>{timeout}s)")
+            return ""
+        except Exception as e:
+            logger.warning(f"self-reply | memory | 知识库检索失败: {e}")
+            return ""
 
     @staticmethod
     def _append_recall_if_missing(

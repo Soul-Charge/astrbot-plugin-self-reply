@@ -71,7 +71,7 @@
 | | kb_enable | true | 启用 AstrBot 知识库检索 |
 | | kb_top_k | 0 | 知识库返回条数，0 = 跟随全局 `kb_final_top_k`（保留会话级 kb_config） |
 | | max_chars | 3000 | 召回块总字符上限，超出截断 |
-| | timeout_sec | 5.0 | 召回整体超时，超时本轮不注入 |
+| | timeout_sec | 5.0 | 记忆/知识库各自的检索超时（并发执行，任一超时只丢该来源） |
 | | inject_into_judge | true | 判定阶段也注入召回内容 |
 | | record_bot_reply | false | 把自主回复写回 LivingMemory，使纯插话群聊也能触发反思总结 |
 | whitelist | allowed_origins | [] | unified_msg_origin 或群号白名单，留空全群生效 |

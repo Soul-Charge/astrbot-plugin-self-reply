@@ -300,3 +300,28 @@ if hasattr(self.context, "kb_manager") and self.context.kb_manager:
 2. `@小盐 reset` 后紧接旧话题 → 日志出现 `self-reply | 会话已重置，同步清空插话历史缓存`，回复不再复述重置前细节。
 3. `docker logs astrbot | grep OnAfterMessageSentEvent` → `astrbot_plugin_self_reply - on_after_message_sent` 现在排在链首。
 
+### 7.6 首轮线上验证发现的问题与二次修复（2026-09-11 22:10~22:40）
+
+首轮线上验证结果：召回本身成功（`召回 3 条记忆 scope=global persona=小盐-new chars=2000`，判定与生成 prompt 均带上召回块，回复不再把“三X”当编造词）；但暴露出两个问题：
+
+1. **单次召回被整体丢弃**：22:36 那轮日志为
+   ```text
+   22:36:49  self-reply | memory | 召回 3 条记忆 ... chars=2000
+   22:36:52  self-reply | memory | 召回超时(>5.0s)
+   ```
+   记忆检索（本轮冷缓存约 5s）成功，但紧随其后的知识库检索把 `memory.timeout_sec=5s` 的总预算耗尽，`asyncio.wait_for` 取消了整个 `_collect_recall`，**记忆与知识库一起被丢掉** → 该轮回复退回“其实窝也只知道ta叫三X”。
+2. **检索槽位被“最近记忆”挤占**：LivingMemory `_merge_recent_memories()` 的实现为 `selected = results[: k - recent_count]`，本机 `recent_memory_count=2`、`recall_engine.top_k=3`，即 k=3 时只保留**检索排名第 1** 的结果，另外两席给“最近记忆”。实体记忆（Doc 53「user是窝的姐X」）只有排到第 1 才会进入注入块。
+
+二次修复：
+
+| 改动 | 说明 |
+|---|---|
+| `main.py` 召回改为**两路并发 + 各自独立超时** | `asyncio.gather(memory_block, kb_block)`，每个来源单独 `wait_for(memory.timeout_sec)`；任一来源超时/异常只丢弃该来源，另一个照常注入（`timeout_sec` 语义由“整体超时”变为“每个来源的超时”） |
+| 新增召回块使用提示 `RECALL_USAGE_HINT` | 置于块首（先于条目，避免截断丢失）：“同一个人的不同写法（繁简/全称/简称/别称）请视为同一实体；记忆里写明的关系请直接采用，不要回答不认识” |
+| `memory_bridge.truncate_block()` | 按条目边界截断（能保留一半以上时才按边界切），避免半句话被腰斩 |
+| 配置建议 | `memory.top_k` 建议 5（k=5 时顶部 3 条检索结果 + 2 条最近记忆，实体记忆不必再抢第 1）；`memory.max_chars` 建议 3000（LivingMemory formatter 单条约 850 字，3 条即触顶 2000） |
+
+测试：`120 passed → 126 passed`（新增 KB 超时不丢记忆、记忆超时不丢 KB、两路并发、块首使用提示、块级截断等用例）。
+
+结论：**数据侧没问题**（`livingmemory.db` 中 Doc 53 / Doc 64 均明确记录“user是窝的姐X，教窝叫 E0 妈X”），问题在注入链路的健壮性与槽位预算，已按上表修复。
+
