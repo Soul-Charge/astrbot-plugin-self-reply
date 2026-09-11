@@ -325,3 +325,31 @@ if hasattr(self.context, "kb_manager") and self.context.kb_manager:
 
 结论：**数据侧没问题**（`livingmemory.db` 中 Doc 53 / Doc 64 均明确记录“user是窝的姐X，教窝叫 E0 妈X”），问题在注入链路的健壮性与槽位预算，已按上表修复。
 
+### 7.7 线上验证结果（2026-09-11 23:04，已通过）
+
+唤醒前缀恢复为 `["/"]`（AstrBot 默认值，实际生效文件为 `data/config/abconf_*.json`），随后用 `/reset` 完成一组验证：
+
+```text
+[23:04:05.521] [respond.stage] Prepare to send - E0/8000000000: ✅ Conversation reset successfully.
+[23:04:05.799] hook(OnAfterMessageSentEvent) -> astrbot_plugin_self_reply - on_after_message_sent
+[23:04:05.799] self-reply | 会话已重置，同步清空插话历史缓存: bot:GroupMessage:400000000
+[23:04:05.799] hook(OnAfterMessageSentEvent) -> astrbot_plugin_livingmemory - handle_session_reset
+[23:04:05.814] hook(OnAfterMessageSentEvent) -> meme_manager - after_message_sent
+[23:04:05.814] hook(OnAfterMessageSentEvent) -> astrbot - after_message_sent
+```
+
+→ **场景 3 修复确认**：self-reply 排在 after-sent 链首并成功清空缓存；排在它后面的 meme_manager / astrbot / LivingMemory 钩子全部照常执行，没有被抢占。
+
+记忆注入侧同样通过：
+
+- `self-reply | memory | 召回 5 条记忆 scope=global persona=小盐-new chars=3000`（`top_k=5`、`max_chars=3000` 生效）
+- judge 思维链出现「记忆里user是教小盐叫零X妈X的人」，并据此判定 reply
+- 生成回复：`三X酱就是user啦，当初就是ta教猫猫喊妈X的喵~不许再拿三X逗窝了，蹭蹭。`（对应 1.1 节“失忆”问题）
+- KB 偶发超时（`22:56:44 知识库检索超时(>5.0s)`）时记忆块仍照常注入 → 7.6 的并发 + 独立超时修复生效（旧实现会把两者一起丢弃）
+
+运维备注：
+
+- 手打的 `@小盐` 不含 `at` 段，AstrBot 不视为唤醒（`wake_prefix` 为空时只有真 `At` 段才唤醒）；要沿用“手打 @小盐 reset”的习惯，可把 `@小盐` 加进 `wake_prefix`，或直接使用 `/reset`。
+- `memory.timeout_sec` 语义为“每个来源的超时”，两者并发执行；知识库冷启动偶发 >5s 时会被丢弃，可按需调到 8。
+
+
