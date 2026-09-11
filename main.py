@@ -6,6 +6,7 @@ import re
 import sys
 import time
 from collections import deque
+from dataclasses import replace as dataclass_replace
 from datetime import datetime
 from uuid import uuid4
 
@@ -20,6 +21,12 @@ from .image_resolver import resolve
 from .judge_utils import DEFAULT_GENERATE_PROMPT, parse_judge_output
 from .kb_bridge import retrieve_kb_block
 from .memory_bridge import EventShim, MemoryBridge, truncate_block
+from .pipeline_dispatch import (
+    PIPELINE_HOOK_PRIORITY,
+    PipelineDispatcher,
+    PipelineJob,
+    new_message_id,
+)
 from .plugin_config import PluginConfig, parse_plugin_config
 from .reply_tracker import ReplyTracker
 from .runtime_state import OriginState, RuntimeState
@@ -28,6 +35,7 @@ from .tag_utils import (
     MENTION_RE,
     QUOTE_CLOSE_RE,
     QUOTE_RE,
+    chain_has_refuse_tag,
     normalize_id,
     transform_result_chain,
 )
@@ -91,6 +99,67 @@ def clean_text(text: str) -> str:
     text = MENTION_RE.sub(r"[At: \1]", text)
     text = MENTION_CLOSE_RE.sub("", text)
     return text.strip()
+
+
+def build_generate_prompt(
+    prompt_tmpl: str,
+    *,
+    history_text: str,
+    targets_str: str,
+    quote_rule: str,
+    anti_repeat_instr: str,
+    recall_text: str,
+) -> str:
+    """渲染插话生成提示词。
+
+    抽成纯函数是为了让两种派发模式共享同一套拼装逻辑：
+    ``pipeline`` 模式传空召回（记忆/知识库由主管道的钩子注入），
+    注入失败回退直连时再用召回块渲染一次。
+    """
+    if "{history_text}" in prompt_tmpl and "{targets_str}" in prompt_tmpl:
+        try:
+            prompt = prompt_tmpl.format(
+                history_text=history_text,
+                targets_str=targets_str,
+                quote_rule=quote_rule,
+                anti_repeat_instr=anti_repeat_instr,
+                recalled_memories=recall_text,
+            )
+        except Exception as e:
+            logger.warning(
+                f"self-reply | format prompt_template 失败: {e}，回退标准拼接"
+            )
+            prompt = _fallback_generate_prompt(
+                prompt_tmpl, history_text, targets_str, quote_rule, anti_repeat_instr
+            )
+    else:
+        prompt = _fallback_generate_prompt(
+            prompt_tmpl, history_text, targets_str, quote_rule, anti_repeat_instr
+        )
+    return Main._append_recall_if_missing(prompt, prompt_tmpl, recall_text)
+
+
+def _fallback_generate_prompt(
+    prompt_tmpl: str,
+    history_text: str,
+    targets_str: str,
+    quote_rule: str,
+    anti_repeat_instr: str,
+) -> str:
+    return (
+        f"{prompt_tmpl}\n\n"
+        f"Chat history:\n{history_text}\n\n"
+        f"The following are the recent message(s) you are responding to or commenting on:\n"
+        f"{targets_str}\n\n"
+        "Do NOT assume those messages were addressed to you unless they @, quote, "
+        "or clearly mention you. If they are between other members, you may still "
+        "naturally join the group conversation when appropriate, but do not claim "
+        "they were talking to you or treat yourself as the topic unless the evidence "
+        "shows that.\n\n"
+        f"{quote_rule}"
+        "Output only your reply, nothing else. Use the same language as the chatroom.\n"
+        f"{anti_repeat_instr}"
+    )
 
 
 def is_directed_to_other(event: AstrMessageEvent, self_id: str) -> bool:
@@ -185,6 +254,7 @@ class Main(star.Star):
         self.runtime.max_origins = self._config.global_settings.max_origins
         self.tracker = ReplyTracker()
         self.memory = MemoryBridge(context)
+        self.dispatcher = PipelineDispatcher(context)
 
     def _cfg(self) -> PluginConfig:
         return self._config
@@ -379,6 +449,8 @@ class Main(star.Star):
         if not state.pending_messages:
             return
 
+        pipeline_mode = cfg.dispatch.mode == "pipeline"
+
         # 自愈兜底：核心会话被 /reset 或 /new 重置时，钩子链可能因
         # event.is_stopped() 提前中断，这里再按会话指纹检测一次。
         if await self._detect_core_session_reset(origin, state):
@@ -404,6 +476,8 @@ class Main(star.Star):
                 origin, shim, recall_query, persona_id, cfg
             )
             judge_recall = recall_block if cfg.memory.inject_into_judge else ""
+            # 管道模式下记忆/知识库由主流程钩子与核心 KB 注入，生成侧不再重复注入
+            gen_recall = "" if pipeline_mode else recall_block
 
             # Build judge input
             history_slice = state.session_chats[-cfg.judge.history_messages :]
@@ -511,52 +585,57 @@ class Main(star.Star):
                 getattr(cfg.generate, "prompt_template", None)
                 or DEFAULT_GENERATE_PROMPT
             )
-            if "{history_text}" in prompt_tmpl and "{targets_str}" in prompt_tmpl:
-                try:
-                    gen_prompt = prompt_tmpl.format(
-                        history_text=history_text,
-                        targets_str=targets_str,
-                        quote_rule=quote_rule,
-                        anti_repeat_instr=anti_repeat_instr,
-                        recalled_memories=recall_block,
-                    )
-                except Exception as e:
-                    logger.warning(
-                        f"self-reply | format prompt_template 失败: {e}，回退标准拼接"
-                    )
-                    gen_prompt = (
-                        f"{prompt_tmpl}\n\n"
-                        f"Chat history:\n{history_text}\n\n"
-                        f"The following are the recent message(s) you are responding to or commenting on:\n"
-                        f"{targets_str}\n\n"
-                        "Do NOT assume those messages were addressed to you unless they @, quote, "
-                        "or clearly mention you. If they are between other members, you may still "
-                        "naturally join the group conversation when appropriate, but do not claim "
-                        "they were talking to you or treat yourself as the topic unless the evidence "
-                        "shows that.\n\n"
-                        f"{quote_rule}"
-                        "Output only your reply, nothing else. Use the same language as the chatroom.\n"
-                        f"{anti_repeat_instr}"
-                    )
-            else:
-                gen_prompt = (
-                    f"{prompt_tmpl}\n\n"
-                    f"Chat history:\n{history_text}\n\n"
-                    f"The following are the recent message(s) you are responding to or commenting on:\n"
-                    f"{targets_str}\n\n"
-                    "Do NOT assume those messages were addressed to you unless they @, quote, "
-                    "or clearly mention you. If they are between other members, you may still "
-                    "naturally join the group conversation when appropriate, but do not claim "
-                    "they were talking to you or treat yourself as the topic unless the evidence "
-                    "shows that.\n\n"
-                    f"{quote_rule}"
-                    "Output only your reply, nothing else. Use the same language as the chatroom.\n"
-                    f"{anti_repeat_instr}"
-                )
-
-            gen_prompt = self._append_recall_if_missing(
-                gen_prompt, prompt_tmpl, recall_block
+            gen_prompt = build_generate_prompt(
+                prompt_tmpl,
+                history_text=history_text,
+                targets_str=targets_str,
+                quote_rule=quote_rule,
+                anti_repeat_instr=anti_repeat_instr,
+                recall_text=gen_recall,
             )
+
+            allowed_ids = {extract_msg_id_from_line(line) for line in history_slice}
+            allowed_ids.discard(None)
+
+            # 管道模式：把生成交回 AstrBot 主管道（注入一条合成唤醒事件），
+            # 由主流程完成 LLM 调用与发送，记忆召回/反思等钩子自然触发。
+            if pipeline_mode:
+                job = PipelineJob(
+                    message_id=new_message_id(),
+                    origin=origin,
+                    prompt=gen_prompt,
+                    system_prompt=persona_prompt,
+                    query_text=recall_query,
+                    image_urls=list(image_urls),
+                    allowed_msg_ids=set(allowed_ids),
+                    reply_targets=list(ok_targets),
+                    should_quote=should_quote,
+                    quote_policy=cfg.generate.quote_policy,
+                    provider_id=cfg.generate.provider_id or "",
+                    self_id=str(pending[-1].get("self_id") or ""),
+                    group_id=str(pending[-1].get("group_id") or ""),
+                    platform=str(pending[-1].get("platform") or ""),
+                    nickname=persona_name,
+                )
+                if await self.dispatcher.dispatch(job):
+                    logger.info(
+                        f"self-reply | 插话已交回主管道 origin={origin} "
+                        f"targets={ok_targets} should_quote={should_quote}"
+                    )
+                    return
+                logger.warning(
+                    "self-reply | pipeline dispatch 失败，回退插件直连生成"
+                )
+                self.dispatcher.discard(job)
+                # 直连兜底需要召回块：用同一套拼装逻辑重新渲染一次
+                gen_prompt = build_generate_prompt(
+                    prompt_tmpl,
+                    history_text=history_text,
+                    targets_str=targets_str,
+                    quote_rule=quote_rule,
+                    anti_repeat_instr=anti_repeat_instr,
+                    recall_text=recall_block,
+                )
 
             gen_provider_id = cfg.generate.provider_id or None
             gen_provider = self._resolve_provider(gen_provider_id)
@@ -620,11 +699,7 @@ class Main(star.Star):
                 logger.info("self-reply | refuse or empty")
                 return
 
-            # Tags
-            allowed_ids = {extract_msg_id_from_line(l) for l in history_slice}
-            allowed_ids.discard(None)
-
-            # 只有问句才允许引用；普通直接回复即使模型误加了 quote 标签也会被剥掉
+            # Tags（allowed_ids 已在上方计算，供两种派发模式共用）
             quote_allowed = should_quote and cfg.generate.quote_policy != "none"
             if not quote_allowed:
                 response_text = QUOTE_RE.sub("", response_text)
@@ -1042,13 +1117,174 @@ class Main(star.Star):
             )
         return "\n".join(out)
 
-    # ---------------- Hook 3: reload 清理 ----------------
+    # ---------------- Hook 3: 主管道（pipeline）模式 ----------------
+
+    @filter.on_llm_request(priority=PIPELINE_HOOK_PRIORITY)
+    async def on_pipeline_llm_request(self, event: AstrMessageEvent, req) -> None:
+        """把本插件登记好的插话载荷写进主管道构造的 ProviderRequest。
+
+        优先级必须高于长期记忆插件的召回钩子：本钩子先写入 prompt，
+        随后 LivingMemory 的召回注入叠加在同一个 prompt 上（不会被覆盖）。
+        """
+        job = self.dispatcher.find(event)
+        if job is None:
+            return
+        cfg = self._cfg()
+
+        req.prompt = job.prompt
+        if job.system_prompt:
+            current = req.system_prompt or ""
+            req.system_prompt = (
+                f"{job.system_prompt}\n\n{current}" if current else job.system_prompt
+            )
+        # 合成事件的发送者是 bot 自己，去掉“某个用户正在说话”的提醒，避免误导
+        self._strip_self_identity_reminder(req, job)
+        if job.image_urls:
+            req.image_urls = list(job.image_urls)
+        if not cfg.dispatch.allow_tools and req.func_tool is not None:
+            req.func_tool = None
+        if not cfg.dispatch.keep_conversation:
+            # 不挂核心会话：避免插话提示词被写进核心对话历史
+            req.conversation = None
+
+        logger.info(
+            f"self-reply | pipeline 注入完成 origin={job.origin} "
+            f"msg_id={job.message_id} keep_conv={cfg.dispatch.keep_conversation} "
+            f"tools={'on' if cfg.dispatch.allow_tools else 'off'}"
+        )
+
+    @staticmethod
+    def _strip_self_identity_reminder(req, job: PipelineJob) -> None:
+        if not job.self_id or not req.system_prompt:
+            return
+        pattern = re.compile(
+            rf"User ID:\s*{re.escape(str(job.self_id))}\s*,\s*Nickname:\s*[^\n<]*"
+        )
+        req.system_prompt = pattern.sub(
+            "You are the sender of this turn (this is your own message).",
+            req.system_prompt,
+        )
+
+    @filter.on_decorating_result()
+    async def on_pipeline_decorating_result(self, event: AstrMessageEvent) -> None:
+        """装饰主管道生成的结果：标签解析、强制引用兜底、拒答与防重复。
+
+        装饰发生在 RespondStage 发送之前，所以在这里清空结果链即可实现
+        “这一轮不发言”。
+        """
+        job = self.dispatcher.find(event)
+        if job is None:
+            return
+        cfg = self._cfg()
+        result = event.get_result()
+        chain = list(getattr(result, "chain", None) or [])
+        if not chain:
+            job.dropped = True
+            logger.info("self-reply | pipeline 结果为空，取消发送")
+            return
+
+        # 生成期间发生 /reset、状态被清理 → 本轮上下文已作废
+        if self.runtime.get(job.origin) is None:
+            result.chain = []
+            job.dropped = True
+            logger.info(f"self-reply | pipeline 会话已被重置，取消发送 {job.origin}")
+            return
+
+        if chain_has_refuse_tag(chain):
+            result.chain = []
+            job.dropped = True
+            logger.info("self-reply | pipeline 命中 <refuse/>，取消发送")
+            return
+
+        transformed = transform_result_chain(
+            chain, parse_mention=True, allowed_msg_ids=job.allowed_msg_ids
+        )
+        if transformed:
+            chain = transformed
+        if (
+            job.should_quote
+            and job.quote_policy == "judge"
+            and job.reply_targets
+            and not any(isinstance(c, Reply) for c in chain)
+        ):
+            chain = [Reply(id=job.reply_targets[0]), *chain]
+
+        text = self._chain_text(chain)
+        if not text.strip():
+            result.chain = []
+            job.dropped = True
+            logger.info("self-reply | pipeline 结果无有效文本，取消发送")
+            return
+
+        state = self.runtime.get(job.origin)
+        if (
+            cfg.anti_repeat.enable
+            and cfg.anti_repeat.compare_window > 0
+            and state is not None
+        ):
+            dup, ratio = self.tracker.find_duplicate(
+                self._recent_replies_view(state, cfg.anti_repeat.compare_window),
+                text,
+                cfg.anti_repeat.similarity_threshold,
+            )
+            if dup:
+                result.chain = []
+                job.dropped = True
+                logger.info(
+                    f"self-reply | pipeline 回复与近期重复 ratio={ratio:.2f}，取消发送"
+                )
+                return
+
+        job.final_text = text
+        result.chain = chain
+
+    @staticmethod
+    def _chain_text(chain: list) -> str:
+        parts: list[str] = []
+        for comp in chain:
+            if isinstance(comp, Plain):
+                parts.append(comp.text or "")
+        return "".join(parts)
+
+    @staticmethod
+    def _recent_replies_view(state: OriginState, window: int) -> OriginState:
+        recent = list(state.recent_bot_replies)[-window:] if window > 0 else []
+        return dataclass_replace(
+            state, recent_bot_replies=deque(recent, maxlen=20)
+        )
+
+    def _record_pipeline_reply(self, job: PipelineJob) -> None:
+        """发送成功后把主管道生成的回复写回插件自己的历史与去重记录。"""
+        state = self.runtime.get(job.origin)
+        if state is None:
+            return
+        text = job.final_text or ""
+        if not text:
+            return
+        cfg = self._cfg()
+        self.tracker.mark_replied(state, job.reply_targets)
+        self.tracker.register_bot_reply(state, text)
+        state.last_reply_ts = time.time()
+        state.session_chats.append(
+            f"[You/{datetime.now().strftime('%H:%M:%S')}]: {clean_text(text)}"
+        )
+        while len(state.session_chats) > cfg.history.max_messages:
+            removed = state.session_chats.pop(0)
+            rid = extract_msg_id_from_line(removed)
+            if rid:
+                state.image_registry.pop(rid, None)
+        logger.info(
+            f"self-reply | pipeline 回复已发送 origin={job.origin} "
+            f"targets={job.reply_targets}"
+        )
+
+    # ---------------- Hook 4: reload 清理 ----------------
 
     async def terminate(self):
         for origin in list(self.runtime.origins.keys()):
             self.runtime.cleanup(origin)
 
-    # ---------------- Hook 4: 监听会话重置 (/reset 或 /new) ----------------
+    # ---------------- Hook 5: 监听会话重置 (/reset 或 /new) ----------------
 
     @filter.after_message_sent(priority=RESET_HOOK_PRIORITY)
     async def on_after_message_sent(self, event: AstrMessageEvent):
@@ -1058,6 +1294,9 @@ class Main(star.Star):
         中断后续 handler，命令事件（/reset、/new）在多数链路上到达这里前
         就已经是 stopped 状态，只有排在链首才能收到通知。
         """
+        job = self.dispatcher.take(event)
+        if job is not None and not job.dropped and job.final_text:
+            self._record_pipeline_reply(job)
         self._handle_session_reset(event)
 
     def _handle_session_reset(self, event: AstrMessageEvent) -> bool:

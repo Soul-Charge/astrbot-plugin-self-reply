@@ -41,7 +41,38 @@
 - **记忆与知识库联动**：判定/生成前从 `astrbot_plugin_livingmemory` 召回长期记忆、从 AstrBot 知识库召回相关知识，拼成"相关背景"块注入提示词；插件缺失、未初始化、超时或检索报错时自动降级为空块，不影响插话。自定义提示词可用 `{recalled_memories}` 占位符控制位置，未写则自动追加到提示词末尾。
 - **重置可靠清理**：`/reset`、`/new` 之后立即清空该会话的滑动窗口历史、待判定队列、图片注册与已回复记账；钩子以最高优先级注册（命令事件常常已被 stop，排在链尾的钩子收不到通知），另有会话指纹自愈与"生成期间被重置则丢弃本轮回复"双重兜底。
 - **图片上下文**：近期群图注册表，生成时最多附带 N 张原图（视觉模型）。
+- **两种发起方式**：`dispatch.mode=direct`（插件自己调 Provider 生成并发送）或 `pipeline`（把生成交回 AstrBot 主管道，见下节），后者让长期记忆的召回与反思总结、其他插件的结果装饰、TTS/t2i 等自然生效；注入失败或平台不是 aiocqhttp 时自动回退 direct。
 - **容量治理**：历史 50 条/会话、已回复注册表 200 条、会话状态 LRU 500 个，插件卸载时清理防抖任务。
+
+## 发起方式：direct 与 pipeline
+
+判定永远由插件自己做（轻量模型、不污染会话），区别在"生成 + 发送"这一步：
+
+| | direct（默认） | pipeline |
+|---|---|---|
+| 生成 | 插件 `provider.text_chat()` | 交回 AstrBot 主管道 |
+| 发送 | `StarTools.send_message()` | `RespondStage` 由平台适配器发送 |
+| `on_llm_request`（记忆召回注入） | 插件自己用 memory_bridge 检索注入 | LivingMemory 自己的钩子注入 |
+| `on_llm_response`（记忆反思/总结） | 不触发（除非 `memory.record_bot_reply`） | 自然触发 |
+| 知识库 | 插件 kb_bridge 检索 | 核心 `_apply_kb` 注入 |
+| 人格 | 插件注入 `system_prompt` | 插件注入 + 核心 system reminders |
+| 其他插件的结果装饰 / after_sent 钩子 | 不经过 | 经过 |
+| 生成用的 Provider | `generate.provider_id` | `generate.provider_id`（作为 `selected_provider` 传给主流程，找不到则回退会话默认） |
+| 阻塞管道 | 不阻塞 | 不阻塞（合成事件独立成一条事件） |
+| 平台限制 | 无 | 仅 aiocqhttp |
+
+实现方式（`pipeline_dispatch.py`）：构造一条"bot 发给自己所在群"的合成唤醒事件
+（At 段 + `is_at_or_wake_command=True`，不依赖 `wake_prefix` 配置）并提交进事件队列，
+载荷（prompt、人格、引用目标、允许引用的 msg_id）按 `message_id` 登记，
+再由本插件三个钩子各管一段：
+
+- `on_llm_request`（优先级 100，必须早于 LivingMemory 的召回钩子）：写入 prompt/人格/图片，
+  默认置空 `conversation`（不写核心对话历史）与工具集；
+- `on_decorating_result`：标签解析（`<quote>`/`<mention>`）、强制引用兜底、`<refuse/>` 与重复检测（命中就清空结果链，这一轮不发言）；
+- `after_message_sent`：把最终文本写回插件的滑动窗口历史、已回复注册表与冷却时间戳。
+
+注意：`pipeline` 模式下插话会进入平台消息历史与统计；若同时启用会改写 `req.prompt` 的插件
+（如 enhance mode 的 React 模式），其钩子排在后面会覆盖插话提示词。
 
 ## 配置说明
 
@@ -75,6 +106,9 @@
 | | inject_into_judge | true | 判定阶段也注入召回内容 |
 | | record_bot_reply | false | 把自主回复写回 LivingMemory，使纯插话群聊也能触发反思总结 |
 | whitelist | allowed_origins | [] | unified_msg_origin 或群号白名单，留空全群生效 |
+| dispatch | mode | direct | direct / pipeline，见上节 |
+| | allow_tools | false | pipeline 模式是否允许模型调用工具 |
+| | keep_conversation | false | pipeline 模式是否把插话挂到核心会话（挂上会写入核心对话历史） |
 | global_settings | max_origins | 500 | 会话状态 LRU 上限 |
 | | judge_timeout_sec | 45.0 | 判定超时 |
 | | generate_timeout_sec | 60.0 | 生成超时 |
@@ -106,4 +140,4 @@ python -m pytest /AstrBot/data/plugins/astrbot_plugin_self_reply/tests -q
 python -m pytest tests -q
 ```
 
-覆盖范围：配置解析容错（含 `memory` 组）、标签/引用/拒答处理、图片 URL/base64 解析、回复记账（冷却/已回复/相似度）、判定输出解析（JSON/容错）、记忆桥（LivingMemory 发现/门禁/作用域/截断/写回与降级）、知识库桥（官方入口复用/本地兜底/降级）、会话重置清理（钩子优先级/指纹自愈/在途守卫）与召回注入。
+覆盖范围：配置解析容错（含 `memory` / `dispatch` 组）、标签/引用/拒答处理、图片 URL/base64 解析、回复记账（冷却/已回复/相似度）、判定输出解析（JSON/容错）、记忆桥（LivingMemory 发现/门禁/作用域/截断/写回与降级）、知识库桥（官方入口复用/本地兜底/降级）、会话重置清理（钩子优先级/指纹自愈/在途守卫）与召回注入、主管道派发（合成事件构造/唤醒标记/载荷登记/三个往返钩子/模式切换与回退）。

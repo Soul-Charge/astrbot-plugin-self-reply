@@ -5,6 +5,7 @@ from dataclasses import dataclass, field
 from .judge_utils import DEFAULT_GENERATE_PROMPT, DEFAULT_JUDGE_PROMPT
 
 _QUOTE_POLICIES = ("judge", "model", "none")
+_DISPATCH_MODES = ("direct", "pipeline")
 
 
 def _to_bool(raw, default: bool = False) -> bool:
@@ -63,6 +64,11 @@ def _to_list(raw, default: list[str]) -> list[str]:
 def _sanitize_quote_policy(raw) -> str:
     policy = str(raw or "").strip().lower()
     return policy if policy in _QUOTE_POLICIES else "judge"
+
+
+def _sanitize_dispatch_mode(raw) -> str:
+    mode = str(raw or "").strip().lower()
+    return mode if mode in _DISPATCH_MODES else "direct"
 
 
 @dataclass(frozen=True)
@@ -124,6 +130,23 @@ class WhitelistConfig:
 
 
 @dataclass(frozen=True)
+class DispatchConfig:
+    """插话的发起方式。
+
+    * ``direct``：插件自己调 Provider 生成、自己发送（旁路主管道）。
+    * ``pipeline``：把生成交回 AstrBot 主管道（注入一条合成唤醒事件），
+      于是 on_llm_request / on_llm_response（长期记忆反思）/ on_decorating_result /
+      RespondStage / after_message_sent 都会自然触发。
+    """
+
+    mode: str = "direct"
+    #: pipeline 模式下是否允许模型调用工具（默认关闭，保持“只说一句话”的行为）
+    allow_tools: bool = False
+    #: pipeline 模式下是否把插话挂到核心会话（挂上会被写入核心对话历史）
+    keep_conversation: bool = False
+
+
+@dataclass(frozen=True)
 class GlobalSettings:
     max_origins: int = 500
     judge_timeout_sec: float = 45.0
@@ -139,6 +162,7 @@ class PluginConfig:
     history: HistoryConfig = field(default_factory=HistoryConfig)
     memory: MemoryConfig = field(default_factory=MemoryConfig)
     whitelist: WhitelistConfig = field(default_factory=WhitelistConfig)
+    dispatch: DispatchConfig = field(default_factory=DispatchConfig)
     global_settings: GlobalSettings = field(default_factory=GlobalSettings)
     enable: bool = False
 
@@ -160,6 +184,7 @@ def parse_plugin_config(raw: dict) -> PluginConfig:
     history_raw = _as_dict(raw.get("history"))
     memory_raw = _as_dict(raw.get("memory"))
     whitelist_raw = _as_dict(raw.get("whitelist"))
+    dispatch_raw = _as_dict(raw.get("dispatch"))
     global_raw = _as_dict(raw.get("global_settings"))
 
     return PluginConfig(
@@ -215,6 +240,11 @@ def parse_plugin_config(raw: dict) -> PluginConfig:
         ),
         whitelist=WhitelistConfig(
             allowed_origins=_to_list(whitelist_raw.get("allowed_origins"), [])
+        ),
+        dispatch=DispatchConfig(
+            mode=_sanitize_dispatch_mode(dispatch_raw.get("mode", "direct")),
+            allow_tools=_to_bool(dispatch_raw.get("allow_tools"), False),
+            keep_conversation=_to_bool(dispatch_raw.get("keep_conversation"), False),
         ),
         global_settings=GlobalSettings(
             max_origins=_to_int(global_raw.get("max_origins"), 500),

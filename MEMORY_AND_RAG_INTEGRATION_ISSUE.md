@@ -353,3 +353,46 @@ if hasattr(self.context, "kb_manager") and self.context.kb_manager:
 - `memory.timeout_sec` 语义为“每个来源的超时”，两者并发执行；知识库冷启动偶发 >5s 时会被丢弃，可按需调到 8。
 
 
+
+## 八、 发起方式改造：把生成交回主管道（2026-09-12）
+
+### 8.1 起因
+
+用户重新安装了早期用于自动回复的 `astrbot_plugin_astrbot_enhance_mode`，并注意到它"能自然触发记忆插件的总结"。源码结论（v0.2.4）：
+
+- 它在 group handler 内 `yield event.request_llm(prompt=..., conversation=conv)`（`main.py:1642`），把 LLM 调用交回 AstrBot 主管道（`ProcessStage` 把 yield 出来的 `ProviderRequest` 交给 `AgentRequestSubStage`），因此 `on_llm_request` / `on_llm_response`（LivingMemory 反思）/ `on_decorating_result` / `RespondStage` / `after_message_sent` 全部自然触发。
+- 判定那一步它其实是直连 `provider.text_chat`（`main.py:1464`），并没有走管道。
+- 它能收到未唤醒消息，是因为 `WakingCheckStage` 的"插件 handler filter"扫描会把任何 filter 命中的 handler 视为唤醒（`waking_check/stage.py:148-237`）。
+
+### 8.2 为什么不照抄 `yield`
+
+`yield` 语义只在 handler 自己的 async generator 内有效（`context_utils.py:call_handler`），而本插件的判定/生成发生在 **防抖后台任务**里（handler 早已返回）。照抄就必须把防抖等待搬进 handler 并阻塞管道：
+
+- 同一条消息的后续插件 handler 会被一起挂住 N 秒（`star_request.py` 顺序 await）；
+- 每条普通群消息都会留下一个挂起协程，还要做"谁负责本轮"的选举；
+- 与正常回复共享 `session_lock_manager` 串行；
+- 事件在管道中悬停期间，`active_event_registry` 一直持有该事件。
+
+### 8.3 采用的方案：注入合成唤醒事件
+
+与官方 `StarTools.create_event`（`astrbot/core/star/star_tools.py:122-203`，docstring："当有需要创建一个事件, 触发某些处理流程时, 使用该方法"）等价，但自建事件以便注入 extras：
+
+1. `PipelineDispatcher.dispatch()` 构造 `AstrBotMessage`（`type=GroupMessage`、`session_id=group_id`、`self_id=bot QQ`、sender=bot 自己）
+   与 `AiocqhttpMessageEvent`，消息链带 `At(bot)` 段并显式置 `is_wake/is_at_or_wake_command=True`（不依赖 `wake_prefix` 配置），
+   设 `selected_provider=generate.provider_id`，然后 `adapter.commit_event(event)` 进事件队列。
+2. 载荷（prompt、人格、图片、引用目标、允许引用的 msg_id）按合成事件的 `message_id`（前缀 `selfreply-pipe-`）登记，供三个钩子取回。
+3. `on_llm_request(priority=100)`：写入 prompt/人格/图片，`conversation=None`（不写核心对话历史），清空工具集；
+   优先级必须高于 LivingMemory 的召回钩子，这样记忆注入叠加在插话 prompt 上而不会被覆盖。
+4. `on_decorating_result()`：标签解析、强制引用兜底、`<refuse/>` 与重复检测（命中则清空结果链 = 本轮不发言）。
+5. `after_message_sent`：把最终文本写回滑动窗口历史、已回复注册表、冷却时间戳；`/reset` 清理逻辑不变。
+6. 任何一步失败（平台非 aiocqhttp、找不到适配器、import 失败）都回退 direct，并用召回块重新渲染提示词。
+
+收益：记忆召回/反思总结、核心知识库、结果装饰与 `after_message_sent` 全部自然生效，
+`memory_bridge` / `kb_bridge` 在 pipeline 模式下不再参与生成侧（判定侧仍用召回块）。
+
+### 8.4 与 direct 模式的差异（需知悉）
+
+- 生成用的 Provider 由主流程选择，本插件以 `selected_provider` 传入 `generate.provider_id`；该 Provider 不存在时回退会话默认 Provider。
+- 插话会出现在平台消息历史与统计里，并经过内容安全检查、频率限制等标准阶段。
+- 不挂核心会话（`keep_conversation=false`）时，`_decorate_llm_request` 不会注入核心人格，人格由插件自己注入；核心上下文仍作为 `req.contexts` 提供给模型。
+- 若同时启用会改写 `req.prompt` 的插件（如 enhance mode 的 React 模式），其 `on_llm_request` 钩子排在后面，会覆盖插话提示词 → 两者不要同时开。

@@ -237,5 +237,33 @@
                 "default": 60.0
             }
         }
+    },
+    "dispatch": {
+        "description": "插话发起方式（主管道 / 直连）",
+        "type": "object",
+        "items": {
+            "mode": {
+                "description": "发起方式",
+                "hint": "direct = 插件自己调 Provider 生成并发送（旁路主管道）；pipeline = 注入一条合成唤醒事件，把生成交回 AstrBot 主管道，于是 on_llm_request（长期记忆召回注入）、on_llm_response（长期记忆反思/总结）、on_decorating_result、RespondStage 发送与 after_message_sent 都会自然触发，且不阻塞管道。仅 aiocqhttp 支持，注入失败自动回退 direct。",
+                "type": "string",
+                "options": [
+                    "direct",
+                    "pipeline"
+                ],
+                "default": "direct"
+            },
+            "allow_tools": {
+                "description": "pipeline 模式允许调用工具",
+                "hint": "关闭时插话只输出一句话（与 direct 行为一致）；开启后模型可在插话里调用已注册工具。",
+                "type": "bool",
+                "default": false
+            },
+            "keep_conversation": {
+                "description": "pipeline 模式挂到核心会话",
+                "hint": "开启后插话会作为一轮对话写进核心会话历史（白捡核心人格与上下文，但插话提示词会出现在后续 @ 回复的上下文里）；默认关闭，由插件注入人格且不写核心历史。",
+                "type": "bool",
+                "default": false
+            }
+        }
     }
 }

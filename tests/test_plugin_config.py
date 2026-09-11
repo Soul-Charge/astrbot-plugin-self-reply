@@ -193,3 +193,30 @@ def test_memory_config_invalid_values_fall_back():
     assert cfg.memory.top_k == 0
     assert cfg.memory.timeout_sec == 5.0
     assert cfg.memory.enable is True
+
+
+def test_dispatch_config_defaults_to_direct():
+    cfg = parse_plugin_config({})
+    assert cfg.dispatch.mode == "direct"
+    assert cfg.dispatch.allow_tools is False
+    assert cfg.dispatch.keep_conversation is False
+
+
+def test_dispatch_config_parsing():
+    cfg = parse_plugin_config(
+        {
+            "dispatch": {
+                "mode": "PIPELINE",
+                "allow_tools": "yes",
+                "keep_conversation": 1,
+            }
+        }
+    )
+    assert cfg.dispatch.mode == "pipeline"
+    assert cfg.dispatch.allow_tools is True
+    assert cfg.dispatch.keep_conversation is True
+
+
+def test_dispatch_config_invalid_mode_falls_back_to_direct():
+    cfg = parse_plugin_config({"dispatch": {"mode": "telepathy"}})
+    assert cfg.dispatch.mode == "direct"
