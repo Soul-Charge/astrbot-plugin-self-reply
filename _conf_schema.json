@@ -61,7 +61,7 @@
                 "description": "判定提示词模板",
                 "hint": "可用占位符：{persona_name} {persona_mask} {pending_count} {pending_msgs} {history_count} {history_lines} {recalled_memories}。JSON 示例行的大括号需写成 {{ }} 转义。",
                 "type": "text",
-                "default": "你当前的人格是:{persona_name}\n人格设定:{persona_mask}\n\n以下群聊最近 {pending_count} 条待判定消息:\n{pending_msgs}\n\n(历史上下文最近 {history_count} 条,已回复的已标为 [replied]):\n{history_lines}\n\n请以你的人格判断是否应该主动回复这些消息,并给出至多 1 个目标 msg_id。\n\n【重要：这是多人群聊，不是私聊】\n- 不是所有消息都发给你。别人 @ 其他群友、引用/回复其他群友的消息，通常是在和其他人说话，默认不要插话。\n- 只有消息 @你、回复/引用你、或明确提到你/你的名字时，才算“发给你”。\n- 如果待判定消息是其他群友之间的连续对话（尤其是一对一闲聊），请 SKIP。\n- 只有当你有非常自然、值得开口的理由（例如话题明显与你有关、你能自然接住梗且不会打扰别人）时，才 REPLY。\n- 普通群聊发言没有明确收件人时，可以按人格判断是否值得主动接话，但不要每条都回。\n\n{{\"decision\":\"reply\",\"target_ids\":[\"msgid\"],\"reason\":\"...\"}}\n{{\"decision\":\"skip\",\"reason\":\"...\"}}\n只输出 JSON,不要额外文字。"
+                "default": "你当前的人格是:{persona_name}\n人格设定:{persona_mask}\n\n以下群聊最近 {pending_count} 条待判定消息:\n{pending_msgs}\n\n(历史上下文最近 {history_count} 条,已回复的已标为 [replied]):\n{history_lines}\n\n请以你的人格判断是否应该主动回复这些消息,并给出至多 1 个目标 msg_id 与 kind。\n\n【kind 判定】\n- task：对方在派活/求答，需要外部信息或工具才能答对（如“查一下/搜一下/是什么/哪一集/帮我…”）；\n  你有联网搜索、抓取网页等工具，task 消息会被允许调用工具，不要因为“我没有联网”而把这类消息判成 chat；\n- chat：闲聊、接梗、情绪互动；\n- 拿不准一律填 chat。\n\n【重要：这是多人群聊，不是私聊】\n- 不是所有消息都发给你。别人 @ 其他群友、引用/回复其他群友的消息，通常是在和其他人说话，默认不要插话。\n- 只有消息 @你、回复/引用你、或明确提到你/你的名字时，才算“发给你”。\n- 如果待判定消息是其他群友之间的连续对话（尤其是一对一闲聊），请 SKIP。\n- 只有当你有非常自然、值得开口的理由（例如话题明显与你有关、你能自然接住梗且不会打扰别人）时，才 REPLY。\n- 普通群聊发言没有明确收件人时，可以按人格判断是否值得主动接话，但不要每条都回。\n\n{{\"decision\":\"reply\",\"target_ids\":[\"msgid\"],\"kind\":\"chat\",\"reason\":\"...\"}}\n{{\"decision\":\"reply\",\"target_ids\":[\"msgid\"],\"kind\":\"task\",\"reason\":\"...\"}}\n{{\"decision\":\"skip\",\"kind\":\"chat\",\"reason\":\"...\"}}\n只输出 JSON,不要额外文字。"
             }
         }
     },
@@ -86,7 +86,11 @@
                 "description": "引用策略",
                 "hint": "judge=仅对问句自动引用（模型漏写引用标签时自动补）；model=仅信任模型自己写的引用并校验存在性；none=不做引用处理。",
                 "type": "string",
-                "options": ["judge", "model", "none"],
+                "options": [
+                    "judge",
+                    "model",
+                    "none"
+                ],
                 "default": "judge"
             },
             "include_role_tag": {
@@ -252,17 +256,71 @@
                 ],
                 "default": "direct"
             },
-            "allow_tools": {
-                "description": "pipeline 模式允许调用工具",
-                "hint": "关闭时插话只输出一句话（与 direct 行为一致）；开启后模型可在插话里调用已注册工具。",
-                "type": "bool",
-                "default": false
-            },
-            "keep_conversation": {
+            "attach_core_conversation": {
                 "description": "pipeline 模式挂到核心会话",
-                "hint": "开启后插话会作为一轮对话写进核心会话历史（白捡核心人格与上下文，但插话提示词会出现在后续 @ 回复的上下文里）；默认关闭，由插件注入人格且不写核心历史。",
+                "hint": "开启（默认）后插话会作为一轮对话写进核心会话历史：模型记得自己插过什么话，代价是历史增长更快（含工具调用消息）。关闭则恢复旧行为（不写核心历史）。注意：旧的 allow_tools / keep_conversation 已废弃——插件现在总是使用核心注入的完整工具集与核心人格。",
                 "type": "bool",
-                "default": false
+                "default": true
+            },
+            "chat_note_template": {
+                "description": "pipeline 模式导演指令模板（闲聊接梗）",
+                "hint": "占位符：{recent_context} {persona_name} {target_id} {target_nick} {target_text} {quote_rule} {anti_repeat_instr}",
+                "type": "text",
+                "default": "[旁白：以下是群聊最近的滚动记录（按时间序，最新在下；可能包含你自己刚说过的话）：\n{recent_context}\n你（{persona_name}）决定主动接一句。\n目标消息 #msg{target_id} {target_nick}：{target_text}\n要求：用一两句口语接住，别复述旁白、别解释你在做什么。\n{quote_rule}{anti_repeat_instr}]"
+            },
+            "task_note_template": {
+                "description": "pipeline 模式导演指令模板（派活求答）",
+                "hint": "占位符同上一项；kind=task 时模型可使用工具。",
+                "type": "text",
+                "default": "[旁白：群聊近况（最近若干条滚动记录）：\n{recent_context}\n群友 #msg{target_id} {target_nick} 向你派了活/提了问题：{target_text}\n你决定接住这件事。需要查证就调用你可用的工具，查完再回答；不需要就直接答。\n要求：结论优先、控制在 3 句以内、不要复述旁白。\n{quote_rule}]"
+            },
+            "recent_context_lines": {
+                "description": "近况块最多保留几行",
+                "hint": "取群聊滚动记录的最后 N 行拼进导演指令；调大更贴近语境，调大也会更费 token。",
+                "type": "int",
+                "default": 12
+            },
+            "recent_context_max_chars": {
+                "description": "近况块字符上限",
+                "hint": "超过则从头部截断（保留最新内容）。",
+                "type": "int",
+                "default": 1200
+            },
+            "chat_tool_mode": {
+                "description": "chat 类插话的工具策略",
+                "hint": "none = 一个工具都不给（最省、最稳）；readonly（默认）= 只保留下面白名单里的工具；all = 不收窄，等同 task。task 类插话（派活/求答）始终使用核心注入的完整工具集，不受此项影响。",
+                "type": "string",
+                "options": [
+                    "none",
+                    "readonly",
+                    "all"
+                ],
+                "default": "readonly"
+            },
+            "chat_tools": {
+                "description": "readonly 模式保留的工具名",
+                "hint": "按工具名精确匹配，认不出的名字自动忽略。默认只留 search_memes（本地检索、只读，且 meme_manager 靠它判断要不要注入取图提示词）。有副作用的工具（llm_poke_user、future_task、send_message_to_user）以及联网工具不建议加进闲聊。",
+                "type": "list",
+                "default": [
+                    "search_memes"
+                ]
+            },
+            "fallback_on": {
+                "description": "空回复兜底范围",
+                "hint": "task（默认）= 只有派活/求答轮最后没有可发送内容时才补一句兜底文案；always = 所有插话轮都补；off = 关闭（这一轮静默不发言）。兜底只在「本轮有结果但没有任何可发送文本」时注入，工具调用轮的空结果不受影响。",
+                "type": "string",
+                "options": [
+                    "task",
+                    "always",
+                    "off"
+                ],
+                "default": "task"
+            },
+            "fallback_text": {
+                "description": "空回复兜底文案",
+                "hint": "派活轮最后没答上来时发出去的这句话。它同样会过防重复登记（同一句在比较窗口内重复会被静默丢弃）。",
+                "type": "text",
+                "default": "呜…猫猫这次没查成，再戳我一下喵"
             }
         }
     }

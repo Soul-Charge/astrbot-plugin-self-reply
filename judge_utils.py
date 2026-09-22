@@ -4,7 +4,15 @@ import json
 import re
 
 ALLOWED_DECISION = {"reply", "skip"}
+ALLOWED_KIND = {"chat", "task"}
+DEFAULT_KIND = "chat"
 JSON_RE = re.compile(r"\{.*\}", re.DOTALL)
+
+
+def normalize_kind(raw) -> str:
+    """归一化 judge 输出的 kind：缺失 / 非法一律回落 chat。"""
+    kind = str(raw or "").strip().lower()
+    return kind if kind in ALLOWED_KIND else DEFAULT_KIND
 
 # 占位符与 main.py 中 judge_prompt 的 .format 参数一一对应；
 # JSON 示例中的大括号需写成 {{ }} 转义，否则 .format 会报错。
@@ -18,7 +26,15 @@ DEFAULT_JUDGE_PROMPT = (
     "(历史上下文最近 {history_count} 条,已回复的已标为 [replied]):\n"
     "{history_lines}\n"
     "\n"
-    "请以你的人格判断是否应该主动回复这些消息,并给出至多 1 个目标 msg_id。\n"
+    "请以你的人格判断是否应该主动回复这些消息,并给出至多 1 个目标 msg_id 与 kind。\n"
+    "\n"
+    "【kind 判定】\n"
+    "- task：对方在派活/求答，需要外部信息或工具才能答对"
+    "（如“查一下/搜一下/是什么/哪一集/帮我…”）；\n"
+    "  你有联网搜索、抓取网页等工具，task 消息会被允许调用工具，"
+    "不要因为“我没有联网”而把这类消息判成 chat；\n"
+    "- chat：闲聊、接梗、情绪互动；\n"
+    "- 拿不准一律填 chat。\n"
     "\n"
     "【重要：这是多人群聊，不是私聊】\n"
     "- 不是所有消息都发给你。别人 @ 其他群友、引用/回复其他群友的消息，"
@@ -29,8 +45,9 @@ DEFAULT_JUDGE_PROMPT = (
     "且不会打扰别人）时，才 REPLY。\n"
     "- 普通群聊发言没有明确收件人时，可以按人格判断是否值得主动接话，但不要每条都回。\n"
     "\n"
-    '{{"decision":"reply","target_ids":["msgid"],"reason":"..."}}\n'
-    '{{"decision":"skip","reason":"..."}}\n'
+    '{{"decision":"reply","target_ids":["msgid"],"kind":"chat","reason":"..."}}\n'
+    '{{"decision":"reply","target_ids":["msgid"],"kind":"task","reason":"..."}}\n'
+    '{{"decision":"skip","kind":"chat","reason":"..."}}\n'
     "只输出 JSON,不要额外文字。"
 )
 
@@ -59,7 +76,12 @@ def parse_judge_output(raw: str, fallback_id: str) -> dict:
     fallback_id = pending 最近一条 msg_id（用于 REPLY 容错）
     """
     if not raw:
-        return {"decision": "skip", "target_ids": [], "reason": "empty"}
+        return {
+            "decision": "skip",
+            "target_ids": [],
+            "kind": DEFAULT_KIND,
+            "reason": "empty",
+        }
     text = raw.strip()
 
     candidates = []
@@ -86,6 +108,7 @@ def parse_judge_output(raw: str, fallback_id: str) -> dict:
                 return {
                     "decision": "reply" if dec.startswith("reply") else "skip",
                     "target_ids": ids,
+                    "kind": normalize_kind(obj.get("kind")),
                     "reason": str(obj.get("reason", "")),
                 }
         except Exception:
@@ -99,6 +122,7 @@ def parse_judge_output(raw: str, fallback_id: str) -> dict:
         return {
             "decision": "reply",
             "target_ids": valid_ids if valid_ids else ([fallback_id] if fallback_id else []),
+            "kind": DEFAULT_KIND,
             "reason": "regex-extracted reply",
         }
 
@@ -108,6 +132,12 @@ def parse_judge_output(raw: str, fallback_id: str) -> dict:
         return {
             "decision": "reply",
             "target_ids": [fallback_id] if fallback_id else [],
+            "kind": DEFAULT_KIND,
             "reason": "fallback REPLY parse",
         }
-    return {"decision": "skip", "target_ids": [], "reason": "fallback SKIP parse"}
+    return {
+        "decision": "skip",
+        "target_ids": [],
+        "kind": DEFAULT_KIND,
+        "reason": "fallback SKIP parse",
+    }

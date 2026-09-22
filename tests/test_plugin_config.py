@@ -8,6 +8,11 @@ from astrbot_plugin_self_reply.judge_utils import (
     DEFAULT_GENERATE_PROMPT,
     DEFAULT_JUDGE_PROMPT,
 )
+from astrbot_plugin_self_reply.pipeline_dispatch import (
+    DEFAULT_CHAT_TOOLS,
+    DEFAULT_FALLBACK_ON,
+    DEFAULT_FALLBACK_TEXT,
+)
 from astrbot_plugin_self_reply.plugin_config import PluginConfig, parse_plugin_config
 
 
@@ -198,8 +203,12 @@ def test_memory_config_invalid_values_fall_back():
 def test_dispatch_config_defaults_to_direct():
     cfg = parse_plugin_config({})
     assert cfg.dispatch.mode == "direct"
-    assert cfg.dispatch.allow_tools is False
-    assert cfg.dispatch.keep_conversation is False
+    # P0a：默认挂核心会话；工具不再由本插件开关
+    assert cfg.dispatch.attach_core_conversation is True
+    assert cfg.dispatch.recent_context_lines == 12
+    assert cfg.dispatch.recent_context_max_chars == 1200
+    assert "{recent_context}" in cfg.dispatch.chat_note_template
+    assert "{recent_context}" in cfg.dispatch.task_note_template
 
 
 def test_dispatch_config_parsing():
@@ -207,16 +216,100 @@ def test_dispatch_config_parsing():
         {
             "dispatch": {
                 "mode": "PIPELINE",
-                "allow_tools": "yes",
-                "keep_conversation": 1,
+                "attach_core_conversation": "no",
+                "chat_note_template": "CUSTOM {recent_context}",
+                "task_note_template": "TASK {target_text}",
+                "recent_context_lines": "5",
+                "recent_context_max_chars": 300,
             }
         }
     )
     assert cfg.dispatch.mode == "pipeline"
-    assert cfg.dispatch.allow_tools is True
-    assert cfg.dispatch.keep_conversation is True
+    assert cfg.dispatch.attach_core_conversation is False
+    assert cfg.dispatch.chat_note_template == "CUSTOM {recent_context}"
+    assert cfg.dispatch.task_note_template == "TASK {target_text}"
+    assert cfg.dispatch.recent_context_lines == 5
+    assert cfg.dispatch.recent_context_max_chars == 300
+
+
+def test_dispatch_config_legacy_keys_are_ignored_and_warned(caplog):
+    # 老键只警告、不做值映射（老默认 keep_conversation=false 若映射会把新默认顶反）
+    cfg = parse_plugin_config(
+        {"dispatch": {"mode": "pipeline", "allow_tools": True, "keep_conversation": False}}
+    )
+    assert cfg.dispatch.attach_core_conversation is True
 
 
 def test_dispatch_config_invalid_mode_falls_back_to_direct():
     cfg = parse_plugin_config({"dispatch": {"mode": "telepathy"}})
     assert cfg.dispatch.mode == "direct"
+
+def test_dispatch_config_defaults_narrow_chat_tools():
+    """P0b：chat 类插话默认只拿到只读白名单（task 类不受影响）。"""
+    cfg = parse_plugin_config({})
+    assert cfg.dispatch.chat_tool_mode == "readonly"
+    assert DEFAULT_CHAT_TOOLS == ("search_memes",)
+    assert cfg.dispatch.chat_tools == DEFAULT_CHAT_TOOLS
+
+
+def test_dispatch_config_chat_tool_keys_parsing():
+    cfg = parse_plugin_config(
+        {
+            "dispatch": {
+                "chat_tool_mode": "NONE",
+                "chat_tools": ["search_memes", " bilibili_read "],
+            }
+        }
+    )
+    assert cfg.dispatch.chat_tool_mode == "none"
+    assert cfg.dispatch.chat_tools == ("search_memes", "bilibili_read")
+
+
+def test_dispatch_config_empty_chat_tools_stays_empty():
+    """白名单显式留空 = 只读模式下一个都不留，不偷偷回退成默认值。"""
+    cfg = parse_plugin_config(
+        {"dispatch": {"chat_tool_mode": "readonly", "chat_tools": []}}
+    )
+    assert cfg.dispatch.chat_tools == ()
+
+
+def test_dispatch_config_invalid_chat_tool_mode_warns_and_falls_back(caplog):
+    with caplog.at_level("WARNING"):
+        cfg = parse_plugin_config({"dispatch": {"chat_tool_mode": "readonlyy"}})
+    assert cfg.dispatch.chat_tool_mode == "none"
+    assert any("chat_tool_mode" in r.getMessage() for r in caplog.records)
+
+
+def test_dispatch_config_missing_chat_tool_mode_is_not_a_warning(caplog):
+    """老配置里没有这个键是正常情况（走默认 readonly），不该刷警告。"""
+    with caplog.at_level("WARNING"):
+        cfg = parse_plugin_config({"dispatch": {"mode": "pipeline"}})
+    assert cfg.dispatch.chat_tool_mode == "readonly"
+    assert not any("chat_tool_mode" in r.getMessage() for r in caplog.records)
+
+
+def test_dispatch_config_fallback_defaults():
+    """P1b：默认只有派活轮兜底，文案走内置默认。"""
+    cfg = parse_plugin_config({})
+    assert cfg.dispatch.fallback_on == "task" == DEFAULT_FALLBACK_ON
+    assert cfg.dispatch.fallback_text == DEFAULT_FALLBACK_TEXT
+
+
+def test_dispatch_config_fallback_keys_parsing():
+    cfg = parse_plugin_config(
+        {"dispatch": {"fallback_on": " ALWAYS ", "fallback_text": " 再问一次喵 "}}
+    )
+    assert cfg.dispatch.fallback_on == "always"
+    assert cfg.dispatch.fallback_text == "再问一次喵"
+
+
+def test_dispatch_config_invalid_fallback_on_warns_and_falls_back(caplog):
+    with caplog.at_level("WARNING"):
+        cfg = parse_plugin_config({"dispatch": {"fallback_on": "alwayss"}})
+    assert cfg.dispatch.fallback_on == "task"
+    assert any("fallback_on" in r.getMessage() for r in caplog.records)
+
+
+def test_dispatch_config_empty_fallback_text_uses_default():
+    cfg = parse_plugin_config({"dispatch": {"fallback_text": "   "}})
+    assert cfg.dispatch.fallback_text == DEFAULT_FALLBACK_TEXT

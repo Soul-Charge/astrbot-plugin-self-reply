@@ -25,10 +25,14 @@ from .pipeline_dispatch import (
     PIPELINE_HOOK_PRIORITY,
     PipelineDispatcher,
     PipelineJob,
+    build_director_note,
+    kept_tool_names,
     new_message_id,
+    should_inject_fallback,
+    truncate_recent_context,
 )
 from .plugin_config import PluginConfig, parse_plugin_config
-from .reply_tracker import ReplyTracker
+from .reply_tracker import ReplyTracker, should_defer_by_cooldown
 from .runtime_state import OriginState, RuntimeState
 from .tag_utils import (
     MENTION_CLOSE_RE,
@@ -90,6 +94,38 @@ def safe_event_str(event, method_name: str) -> str:
         return str(getter() or "")
     except Exception:
         return ""
+
+
+def has_meaningful_content(text: str, image_urls: list, messages) -> bool:
+    """判断消息是否含有可判定的实际内容（文本 / 图片 / 引用回复）。
+
+    纯通知类事件（戳一戳、入群提示等）在 aiocqhttp 适配器里
+    ``abm.message_str`` 为空、``abm.message`` 只有一个 Poke 组件，
+    当前实现会把它记成 "[Empty]" 塞进待判定队列。这类占位一旦排在
+    队列末尾，judge 就会只盯着它判 SKIP，把同一批里真正该回的消息
+    一起丢掉（线上实例：admin 说"小盐讲个鬼故事"后 9 秒有人戳了一下，
+    判定最终只看到那条空消息 → skip，请求再无人回应）。
+    """
+    if (text or "").strip():
+        return True
+    if image_urls:
+        return True
+    for comp in messages:
+        if isinstance(comp, Reply):
+            return True
+    return False
+
+
+def is_noise_entry(entry: dict) -> bool:
+    """待判定条目是否为纯空占位（无文本、无图片）。
+
+    与 :func:`has_meaningful_content` 的区别：这里只看已入队条目里
+    保存的字段，纯图片消息（text="[Empty]" 且 has_image=True）不算噪声。
+    """
+    text = (entry.get("text") or "").strip()
+    if text and text != "[Empty]":
+        return False
+    return not entry.get("has_image")
 
 
 def clean_text(text: str) -> str:
@@ -282,7 +318,9 @@ class Main(star.Star):
                 return
 
         # 记录
-        text = (event.message_str or "").strip() or "[Empty]"
+        raw_str = (event.message_str or "").strip()
+        text = raw_str or "[Empty]"
+        msgs = event.get_messages()
         nick = event.message_obj.sender.nickname
         role = "(admin)" if event.is_admin() else "(member)"
         now = datetime.now().strftime("%H:%M:%S")
@@ -293,6 +331,8 @@ class Main(star.Star):
         for comp in event.get_messages():
             if isinstance(comp, Image):
                 image_urls.append(str(comp.url or comp.file or ""))
+
+        has_content = has_meaningful_content(raw_str, image_urls, msgs)
 
         if cfg.generate.include_sender_id and cfg.generate.include_role_tag:
             header = f"[{nick}/{sender_id}/{now}]{role} #msg{norm_id}:"
@@ -368,6 +408,21 @@ class Main(star.Star):
         if is_wake:
             return
 
+        # 纯通知类事件（戳一戳、入群提示等）没有可判定的内容：
+        # 历史里留个 [Poke] 痕迹，但不进待判定队列。否则它一旦排在末尾，
+        # judge 会只针对这条空消息判 SKIP，连带丢掉同一批里真正该回的消息
+        # （戳一戳本身由 pokepro / poke_request 插件负责回应）。
+        if not has_content:
+            logger.debug(
+                f"self-reply | skip noise event origin={event.unified_msg_origin} "
+                f"sender={sender_id} comps={[type(c).__name__ for c in msgs]}"
+            )
+            # 上面已按统一格式写入一行历史，这里只补个 [Poke] 痕迹，
+            # 不能重复 append，否则同一条通知在上下文里出现两遍。
+            if state.session_chats:
+                state.session_chats[-1] = f"{state.session_chats[-1]} [Poke]"
+            return
+
         # 明确引用/At 其他群友的消息，通常是在和其他人对话；
         # 仍保留在上面的历史上下文中，但不进入自主回复的待判定队列。
         if is_directed_to_other(event, self_id):
@@ -441,6 +496,17 @@ class Main(star.Star):
         except Exception as e:
             logger.error(f"self-reply | debounce fire error: {e}")
 
+    @staticmethod
+    def _requeue_pending(state: OriginState, batch: list[dict], cap: int) -> None:
+        """把整批消息写回 pending 头部（保持原时序），仍受 pending 上限约束。
+
+        冷却命中时用（P1b §4.3）：这批消息已经被判定过，不能像以前那样直接
+        丢掉，否则「冷却期里说的话」永远没人回。
+        """
+        state.pending_messages[:0] = batch
+        while cap > 0 and len(state.pending_messages) > cap:
+            state.pending_messages.pop(0)
+
     async def _handle_pending(self, origin: str) -> None:
         cfg = self._cfg()
         state = self.runtime.get(origin)
@@ -460,9 +526,13 @@ class Main(star.Star):
             pending = list(state.pending_messages)
             state.pending_messages.clear()
 
-            if self.tracker.on_cooldown(state, cfg.trigger.min_reply_interval_seconds):
-                logger.info(
-                    f"self-reply | cooldown hit origin={origin} pending={len(pending)}"
+            # 兜底：整批都是空占位（如纯戳一戳触发的批次）时不叫 judge。
+            # 这类输入必然得到 SKIP，白白烧一次调用；更糟的是它会重置防抖、
+            # 把同批真正该回的消息一起清掉。
+            if all(is_noise_entry(p) for p in pending):
+                logger.debug(
+                    f"self-reply | 整批均为空占位，跳过判定 origin={origin} "
+                    f"pending={len(pending)}"
                 )
                 return
 
@@ -479,50 +549,103 @@ class Main(star.Star):
             # 管道模式下记忆/知识库由主流程钩子与核心 KB 注入，生成侧不再重复注入
             gen_recall = "" if pipeline_mode else recall_block
 
-            # Build judge input
             history_slice = state.session_chats[-cfg.judge.history_messages :]
-            judge_prompt = cfg.judge.prompt_template.format(
-                persona_name=persona_name,
-                persona_mask=persona_prompt,
-                pending_count=len(pending),
-                pending_msgs=self._format_pending(pending, state, cfg),
-                history_count=len(history_slice),
-                history_lines="\n".join(history_slice),
-                recalled_memories=judge_recall,
-            )
-            judge_prompt = self._append_recall_if_missing(
-                judge_prompt, cfg.judge.prompt_template, judge_recall
+
+            # P1b：增量判定。冷却期里被延后写回的条目带着 judged_at；本批若全是
+            # 这类条目，就直接复用上次的判定结果，不再叫一次 judge（§4.3 的
+            # 「已-judge 标记 + 复用判定」），否则同一批消息会被反复判定。
+            fresh = [p for p in pending if not p.get("judged_at")]
+            cached_judge = (
+                state.deferred_judge
+                if isinstance(state.deferred_judge, dict)
+                else None
             )
 
-            provider = self._resolve_provider(cfg.judge.provider_id or None)
-            if not provider:
-                logger.error("self-reply | judge provider not found")
-                return
-
-            try:
-                resp = await asyncio.wait_for(
-                    provider.text_chat(
-                        prompt=judge_prompt, persist=False, session_id=uuid4().hex
-                    ),
-                    timeout=cfg.global_settings.judge_timeout_sec,
+            if fresh:
+                judge_prompt = cfg.judge.prompt_template.format(
+                    persona_name=persona_name,
+                    persona_mask=persona_prompt,
+                    pending_count=len(pending),
+                    pending_msgs=self._format_pending(pending, state, cfg),
+                    history_count=len(history_slice),
+                    history_lines="\n".join(history_slice),
+                    recalled_memories=judge_recall,
                 )
-            except asyncio.TimeoutError:
-                logger.error("self-reply | judge timeout")
-                return
-            except Exception as e:
-                logger.error(f"self-reply | judge fail: {e}")
+                judge_prompt = self._append_recall_if_missing(
+                    judge_prompt, cfg.judge.prompt_template, judge_recall
+                )
+
+                provider = self._resolve_provider(cfg.judge.provider_id or None)
+                if not provider:
+                    logger.error("self-reply | judge provider not found")
+                    return
+
+                try:
+                    resp = await asyncio.wait_for(
+                        provider.text_chat(
+                            prompt=judge_prompt,
+                            persist=False,
+                            session_id=uuid4().hex,
+                        ),
+                        timeout=cfg.global_settings.judge_timeout_sec,
+                    )
+                except asyncio.TimeoutError:
+                    logger.error("self-reply | judge timeout")
+                    return
+                except Exception as e:
+                    logger.error(f"self-reply | judge fail: {e}")
+                    return
+
+                fallback_id = pending[-1]["norm_id"] if pending else ""
+                result = parse_judge_output(
+                    (resp.completion_text or "").strip(),
+                    fallback_id=fallback_id,
+                )
+                kind = str(result.get("kind") or "chat")
+                judged_at = time.time()
+                for p in pending:
+                    p["judged_at"] = judged_at
+                logger.info(
+                    f"self-reply | judge origin={origin} decision={result} "
+                    f"kind={kind} judged={len(pending)}"
+                )
+                if result["decision"] != "reply":
+                    target_ids = []
+                else:
+                    target_ids = [
+                        normalize_id(t) for t in result.get("target_ids") or []
+                    ]
+            elif cached_judge is not None:
+                kind = str(cached_judge.get("kind") or "chat")
+                target_ids = [str(t) for t in cached_judge.get("targets") or []]
+                logger.info(
+                    f"self-reply | 冷却延后批次无新消息，复用上次判定 "
+                    f"origin={origin} kind={kind} targets={target_ids}"
+                )
+            else:
                 return
 
-            fallback_id = pending[-1]["norm_id"] if pending else ""
-            result = parse_judge_output(
-                (resp.completion_text or "").strip(),
-                fallback_id=fallback_id,
+            # P1b（§4.2 方案 A）：冷却检查下移到判定之后。只有非派活类才受冷却
+            # 约束——task（明确的派活/求答）必须接住；命中时把整批写回 pending
+            # 而不是吞掉，并把判定结果留着给下一批复用。
+            on_cooldown = self.tracker.on_cooldown(
+                state, cfg.trigger.min_reply_interval_seconds
             )
-            logger.info(f"self-reply | judge origin={origin} decision={result}")
-
-            if result["decision"] != "reply":
+            if target_ids and should_defer_by_cooldown(kind, on_cooldown=on_cooldown):
+                self._requeue_pending(
+                    state, pending, cfg.trigger.max_pending_before_judge
+                )
+                state.deferred_judge = {"kind": kind, "targets": list(target_ids)}
+                logger.info(
+                    f"self-reply | cooldown hit（延后不丢） origin={origin} "
+                    f"kind={kind} requeued={len(pending)} "
+                    f"pending={len(state.pending_messages)}"
+                )
                 return
-            target_ids = [normalize_id(t) for t in result.get("target_ids") or []]
+            state.deferred_judge = None
+
+            if not target_ids:
+                return
             ok_targets = self.tracker.filter_unreplied(state, target_ids)
             if not ok_targets:
                 logger.info("self-reply | all targets already replied; skip")
@@ -600,10 +723,32 @@ class Main(star.Star):
             # 管道模式：把生成交回 AstrBot 主管道（注入一条合成唤醒事件），
             # 由主流程完成 LLM 调用与发送，记忆召回/反思等钩子自然触发。
             if pipeline_mode:
+                # pipeline 模式用「导演指令」（旁白式），与 direct 模式的完整
+                # 生成模板分开：前者只需近况 + 目标 + 约束，不塞召回块。
+                note_tmpl = (
+                    cfg.dispatch.task_note_template
+                    if kind == "task"
+                    else cfg.dispatch.chat_note_template
+                )
+                director_note = build_director_note(
+                    note_tmpl,
+                    recent_context=truncate_recent_context(
+                        history_text,
+                        max_lines=cfg.dispatch.recent_context_lines,
+                        max_chars=cfg.dispatch.recent_context_max_chars,
+                    ),
+                    persona_name=persona_name,
+                    targets=[
+                        pending_by_id[t] for t in ok_targets if t in pending_by_id
+                    ],
+                    quote_rule=quote_rule,
+                    anti_repeat_instr=anti_repeat_instr,
+                )
                 job = PipelineJob(
                     message_id=new_message_id(),
                     origin=origin,
-                    prompt=gen_prompt,
+                    director_note=director_note,
+                    kind=kind,
                     system_prompt=persona_prompt,
                     query_text=recall_query,
                     image_urls=list(image_urls),
@@ -1107,13 +1252,27 @@ class Main(star.Star):
     def _format_pending(
         self, pending: list[dict], state: OriginState, cfg: PluginConfig
     ) -> str:
+        """拼装待判定消息列表。
+
+        空占位（[Empty] 且无图）不喂给 judge：模型会只盯着最后一条空消息
+        判 SKIP，连带丢掉同一批里的真实消息。有效条目重新编号，保证
+        编号与 ``pending_count``（"最近 N 条"）对得上。
+        带图的条目在文本后补 `` [图片] ``：judge 只收到纯文本的话，
+        看到「这是谁」不会知道有图可识，容易按「拿不准」判成 chat，
+        进而丢掉识图工具。
+        """
         out = []
         for p in pending:
+            if is_noise_entry(p):
+                continue
             replied_mark = (
                 "[replied]" if p["norm_id"] in state.replied_registry else ""
             )
+            img_mark = " [图片]" if p.get("has_image") else ""
             out.append(
-                f"[{p['nick']}/{p['sender_id']}{p['role']} #msg{p['norm_id']}{replied_mark}]: {p['text']}"
+                f"[{len(out) + 1}] "
+                f"[{p['nick']}/{p['sender_id']}{p['role']} #msg{p['norm_id']}"
+                f"{replied_mark}]: {p['text']}{img_mark}"
             )
         return "\n".join(out)
 
@@ -1131,39 +1290,122 @@ class Main(star.Star):
             return
         cfg = self._cfg()
 
-        req.prompt = job.prompt
-        if job.system_prompt:
-            current = req.system_prompt or ""
-            req.system_prompt = (
-                f"{job.system_prompt}\n\n{current}" if current else job.system_prompt
-            )
+        req.prompt = job.director_note
+        # 人格不再由插件重复注入：核心 _ensure_persona_and_skills 会按会话
+        # 人格原生写进 system_prompt（重复注入会让模型看到两遍人设）。
         # 合成事件的发送者是 bot 自己，去掉“某个用户正在说话”的提醒，避免误导
         self._strip_self_identity_reminder(req, job)
         if job.image_urls:
             req.image_urls = list(job.image_urls)
-        if not cfg.dispatch.allow_tools and req.func_tool is not None:
-            req.func_tool = None
-        if not cfg.dispatch.keep_conversation:
+        if not cfg.dispatch.attach_core_conversation:
             # 不挂核心会话：避免插话提示词被写进核心对话历史
             req.conversation = None
 
+        # P0b：按 kind 收窄本轮工具集（chat 只给只读白名单，task 全量）。
+        kept_tools, dropped_tools = self._apply_tool_policy(req, job, cfg)
+        if kept_tools is None:
+            # 拿不到标准 ToolSet：放过（日志退化为如实描述，不改行为）
+            kept_tools = self._tool_names(req)
+            dropped_tools = []
+
+        # 如实记录这一轮真实拿到的能力（P0a 的核心可观测点 + P0b 的策略）。
         logger.info(
             f"self-reply | pipeline 注入完成 origin={job.origin} "
-            f"msg_id={job.message_id} keep_conv={cfg.dispatch.keep_conversation} "
-            f"tools={'on' if cfg.dispatch.allow_tools else 'off'}"
+            f"msg_id={job.message_id} kind={job.kind} "
+            f"conv={bool(req.conversation)} "
+            f"tool_mode={cfg.dispatch.chat_tool_mode} "
+            f"tools={kept_tools}"
+            + (f" dropped={dropped_tools}" if dropped_tools else "")
         )
 
     @staticmethod
+    def _tool_names(req) -> list[str]:
+        """尽量读出 req.func_tool 里的工具名；取不到时退化为 str(...)。
+
+        取名字要容错：测试与将来的实现都可能塞入非 ToolSet 的对象，
+        这里宁可少打一行信息，也不能因为日志把整轮插话搞崩。
+        """
+        toolset = getattr(req, "func_tool", None)
+        if toolset is None:
+            return []
+        tools = getattr(toolset, "tools", None)
+        if not isinstance(tools, list):
+            return [str(toolset)]
+        return [str(getattr(t, "name", t)) for t in tools]
+
+    def _apply_tool_policy(self, req, job: PipelineJob, cfg) -> tuple[list[str] | None, list[str]]:
+        """按 kind 收窄本轮工具集，返回 (保留的工具名, 被摘掉的工具名)。
+
+        P0b 的存在意义：P0a 之后「闲聊接梗」也拿到了全量工具，token 成本、
+        回复延迟与工具报错串进群的窗口期风险都落在闲聊场景里。这里让 chat
+        只拿 dispatch.chat_tools 白名单，task 保持全量（派活要真本事）。
+
+        作用域天然受限：只有本插件自己派发的合成事件才有 job（@ 唤醒的主链路
+        在钩子入口就 return 了），因此不会动到正常对话。
+
+        返回 None 表示「拿不到标准 ToolSet，不要动它」——宁可少收窄一次，
+        也不能让插话在钩子里崩掉。
+        """
+        toolset = getattr(req, "func_tool", None)
+        tools = getattr(toolset, "tools", None)
+        if toolset is None or not isinstance(tools, list):
+            return None, []
+        current = [str(getattr(t, "name", t)) for t in tools]
+        keep = kept_tool_names(
+            kind=job.kind,
+            mode=cfg.dispatch.chat_tool_mode,
+            allowlist=cfg.dispatch.chat_tools,
+            current=current,
+        )
+        keep_set = set(keep)
+        dropped = [name for name in current if name not in keep_set]
+        if not dropped:
+            return keep, []
+        remove_tool = getattr(toolset, "remove_tool", None)
+        if callable(remove_tool):
+            # 就地摘除：保持对象身份不变，避免下游持有引用时看到旧工具集
+            for name in dropped:
+                remove_tool(name)
+        else:
+            toolset.tools = [
+                tool for tool, name in zip(tools, current) if name in keep_set
+            ]
+        return keep, dropped
+
+    @staticmethod
     def _strip_self_identity_reminder(req, job: PipelineJob) -> None:
-        if not job.self_id or not req.system_prompt:
+        """把“发送者是 bot 自己”这条误导性身份提醒换成中性说法。
+
+        v4.28.1 的身份提醒注入点是 req.extra_user_content_parts 里的
+        system_reminder 段落（astr_main_agent._append_system_reminders），
+        不是 req.system_prompt——旧版打在 system_prompt 上的正则是死代码。
+        幂等：没有该提醒（例如 provider_settings.identifier 为 False）时
+        不做任何改动。
+        """
+        if not job.self_id:
             return
+        parts = getattr(req, "extra_user_content_parts", None)
+        if not parts:
+            return
+        marker = f"User ID: {job.self_id},"
         pattern = re.compile(
             rf"User ID:\s*{re.escape(str(job.self_id))}\s*,\s*Nickname:\s*[^\n<]*"
         )
-        req.system_prompt = pattern.sub(
-            "You are the sender of this turn (this is your own message).",
-            req.system_prompt,
-        )
+        for idx, part in enumerate(parts):
+            text = getattr(part, "text", None)
+            if not isinstance(text, str) or marker not in text:
+                continue
+            new_text = pattern.sub(
+                "You are the sender of this turn (this is your own message).", text
+            )
+            if new_text == text:
+                continue
+            try:
+                parts[idx] = type(part)(text=new_text)
+            except Exception as e:  # noqa: BLE001
+                logger.warning(
+                    f"self-reply | 重写 system_reminder 失败（保留原文）: {e}"
+                )
 
     @filter.on_decorating_result()
     async def on_pipeline_decorating_result(self, event: AstrMessageEvent) -> None:
@@ -1179,8 +1421,14 @@ class Main(star.Star):
         result = event.get_result()
         chain = list(getattr(result, "chain", None) or [])
         if not chain:
+            # 工具调用的中间轮也会走到这里：模型只回 tool_calls、content 为空，
+            # 主管道仍然会对这一轮跑 on_decorating_result。这里只代表「本轮没东西
+            # 可发」，不是失败；整轮记不记账由**最后一轮**的结果决定（见下方复位）。
             job.dropped = True
-            logger.info("self-reply | pipeline 结果为空，取消发送")
+            logger.info(
+                f"self-reply | pipeline 本轮无结果（工具轮/空回复），跳过发送 "
+                f"origin={job.origin} msg_id={job.message_id}"
+            )
             return
 
         # 生成期间发生 /reset、状态被清理 → 本轮上下文已作废
@@ -1211,10 +1459,31 @@ class Main(star.Star):
 
         text = self._chain_text(chain)
         if not text.strip():
-            result.chain = []
-            job.dropped = True
-            logger.info("self-reply | pipeline 结果无有效文本，取消发送")
-            return
+            # P1b 空回复兜底：只作用在「本轮有结果、但没有任何可发送文本」这一种
+            # 情况。**不能挪到上面的空链分支**：主管道在结果链为空时根本不会跑
+            # 装饰钩子（core/pipeline/result_decorate/stage.py:131 直接 return），
+            # 我们能看到的空链一定是别的钩子把结果清掉了——线上 2026-09-18
+            # 01:28:21 实测就是工具轮的工具状态消息被 meme_manager 清空，后面
+            # 还会再来一轮真答案；在那里塞文案会被当成工具轮的结果发出去。
+            fallback_text = str(cfg.dispatch.fallback_text or "").strip()
+            if fallback_text and should_inject_fallback(
+                kind=job.kind, mode=cfg.dispatch.fallback_on
+            ):
+                text = fallback_text
+                chain = [c for c in chain if not isinstance(c, Plain)] + [
+                    Plain(fallback_text)
+                ]
+                logger.info(
+                    "self-reply | pipeline 本轮无有效文本，注入兜底文案 "
+                    f"origin={job.origin} msg_id={job.message_id} kind={job.kind}"
+                )
+            else:
+                result.chain = []
+                job.dropped = True
+                logger.info(
+                    f"self-reply | pipeline 结果无有效文本，取消发送 kind={job.kind}"
+                )
+                return
 
         state = self.runtime.get(job.origin)
         if (
@@ -1235,6 +1504,17 @@ class Main(star.Star):
                 )
                 return
 
+        # 接受这一轮的结果 → 复位 dropped。
+        # 工具调用的中间轮会先把 dropped 置起（空链），若不在这里复位，
+        # on_after_message_sent 的守卫会让**这一轮真实发出的回复**整轮跳过记账
+        # （mark_replied / register_bot_reply / last_reply_ts / session_chats），
+        # 连回复已发送的日志都不会有（遗留缺陷 3，2026-09-18 实测）。
+        if job.dropped:
+            logger.debug(
+                "self-reply | pipeline 后一轮结果覆盖了更早的取消标记 "
+                f"origin={job.origin} msg_id={job.message_id}"
+            )
+        job.dropped = False
         job.final_text = text
         result.chain = chain
 

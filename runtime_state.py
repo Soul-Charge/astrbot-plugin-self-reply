@@ -15,6 +15,12 @@ class OriginState:
         default_factory=list
     )  # {norm_id, nick, sender_id, text, has_image, ts, role}
     replied_registry: OrderedDict[str, float] = field(default_factory=OrderedDict)
+    deferred_judge: dict | None = None
+    """冷却期内被延后的判定结果缓存 ``{kind, targets}``（P1b）。
+
+    冷却命中时整批消息会写回 ``pending_messages``，判定结果留在这里；下一批
+    若没有新消息（每条都带 ``judged_at``）就直接复用，不再叫一次 judge。
+    """
     recent_bot_replies: deque = field(default_factory=lambda: deque(maxlen=20))
     msg_fingerprints: dict[str, dict] = field(
         default_factory=dict

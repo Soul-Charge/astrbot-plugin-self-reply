@@ -38,3 +38,12 @@ class ReplyTracker:
     @staticmethod
     def register_bot_reply(st: OriginState, text: str) -> None:
         st.recent_bot_replies.append(text)
+
+
+def should_defer_by_cooldown(kind: str, *, on_cooldown: bool) -> bool:
+    """冷却期内是否把本批判定延后写回（规划 §4.2「方案 A」）。
+
+    只有非派活类才受冷却约束：``kind == "task"``（明确的派活/求答）无论
+    冷却是否命中都要接住，否则群友点名要的东西会被静默丢掉。
+    """
+    return bool(on_cooldown) and kind != "task"

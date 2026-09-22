@@ -2,7 +2,10 @@
 
 import time
 
-from astrbot_plugin_self_reply.reply_tracker import ReplyTracker
+from astrbot_plugin_self_reply.reply_tracker import (
+    ReplyTracker,
+    should_defer_by_cooldown,
+)
 from astrbot_plugin_self_reply.runtime_state import OriginState
 
 
@@ -21,6 +24,16 @@ def test_cooldown_false_after_interval():
     st = OriginState()
     st.last_reply_ts = time.time() - 20
     assert ReplyTracker.on_cooldown(st, 15.0) is False
+
+
+def test_should_defer_by_cooldown_never_defers_task():
+    """P1b：派活消息落在冷却窗口内也要接住，只有闲聊批才延后。"""
+    assert should_defer_by_cooldown("task", on_cooldown=True) is False
+    assert should_defer_by_cooldown("task", on_cooldown=False) is False
+    assert should_defer_by_cooldown("chat", on_cooldown=True) is True
+    assert should_defer_by_cooldown("chat", on_cooldown=False) is False
+    # 判定失败兜底成 chat（保守）：跟着延后，而不是硬发
+    assert should_defer_by_cooldown("", on_cooldown=True) is True
 
 
 def test_filter_unreplied_excludes_marked():

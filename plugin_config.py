@@ -2,7 +2,20 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
+from astrbot.api import logger
+
 from .judge_utils import DEFAULT_GENERATE_PROMPT, DEFAULT_JUDGE_PROMPT
+from .pipeline_dispatch import (
+    CHAT_TOOL_MODES,
+    DEFAULT_CHAT_NOTE_TEMPLATE,
+    DEFAULT_CHAT_TOOLS,
+    DEFAULT_FALLBACK_ON,
+    DEFAULT_FALLBACK_TEXT,
+    DEFAULT_TASK_NOTE_TEMPLATE,
+    FALLBACK_ON_MODES,
+    normalize_chat_tool_mode,
+    normalize_fallback_on,
+)
 
 _QUOTE_POLICIES = ("judge", "model", "none")
 _DISPATCH_MODES = ("direct", "pipeline")
@@ -69,6 +82,33 @@ def _sanitize_quote_policy(raw) -> str:
 def _sanitize_dispatch_mode(raw) -> str:
     mode = str(raw or "").strip().lower()
     return mode if mode in _DISPATCH_MODES else "direct"
+
+
+def _sanitize_chat_tool_mode(raw, default: str = "readonly") -> str:
+    """解析 chat 工具策略：空值走 default，写错则告警并回退 none（最保守）。"""
+    if raw is None or str(raw).strip() == "":
+        return default
+    mode = normalize_chat_tool_mode(raw)
+    if mode != str(raw).strip().lower():
+        logger.warning(
+            f"self-reply | 配置 dispatch.chat_tool_mode={raw!r} 不在 "
+            f"{CHAT_TOOL_MODES} 里，已回退 none（chat 类插话不带工具）。"
+        )
+    return mode
+
+
+def _sanitize_fallback_on(raw, default: str = DEFAULT_FALLBACK_ON) -> str:
+    """解析空回复兜底范围：空值走 default，写错则告警并回退 task。"""
+    if raw is None or str(raw).strip() == "":
+        return default
+    mode = normalize_fallback_on(raw)
+    if mode != str(raw).strip().lower():
+        logger.warning(
+            f"self-reply | 配置 dispatch.fallback_on={raw!r} 不在 "
+            f"{FALLBACK_ON_MODES} 里，已回退 {DEFAULT_FALLBACK_ON}"
+            "（只有派活轮没答上来时才补一句兜底文案）。"
+        )
+    return mode
 
 
 @dataclass(frozen=True)
@@ -140,10 +180,22 @@ class DispatchConfig:
     """
 
     mode: str = "direct"
-    #: pipeline 模式下是否允许模型调用工具（默认关闭，保持“只说一句话”的行为）
-    allow_tools: bool = False
-    #: pipeline 模式下是否把插话挂到核心会话（挂上会被写入核心对话历史）
-    keep_conversation: bool = False
+    #: pipeline 模式下是否把插话挂到核心会话（默认挂上：模型记得自己插过什么话）
+    attach_core_conversation: bool = True
+    #: chat 类插话的工具策略（P0b）：none / readonly / all。task 类始终全量。
+    chat_tool_mode: str = "readonly"
+    #: readonly 模式保留的工具名白名单（只按名字匹配，认不出的名字自然忽略）
+    chat_tools: tuple[str, ...] = DEFAULT_CHAT_TOOLS
+    #: pipeline 模式的导演指令模板（chat = 闲聊接梗 / task = 派活求答）
+    chat_note_template: str = DEFAULT_CHAT_NOTE_TEMPLATE
+    task_note_template: str = DEFAULT_TASK_NOTE_TEMPLATE
+    #: 近况块（{recent_context}）的行数 / 字符上限，防止一轮插话塞爆上下文
+    recent_context_lines: int = 12
+    recent_context_max_chars: int = 1200
+    #: 空回复兜底（P1b）：task / always / off，只有「本轮有结果但没有可发送
+    #: 文本」时才注入，绝不落在工具调用轮（见 pipeline_dispatch 注释）。
+    fallback_on: str = DEFAULT_FALLBACK_ON
+    fallback_text: str = DEFAULT_FALLBACK_TEXT
 
 
 @dataclass(frozen=True)
@@ -185,6 +237,13 @@ def parse_plugin_config(raw: dict) -> PluginConfig:
     memory_raw = _as_dict(raw.get("memory"))
     whitelist_raw = _as_dict(raw.get("whitelist"))
     dispatch_raw = _as_dict(raw.get("dispatch"))
+    if "allow_tools" in dispatch_raw or "keep_conversation" in dispatch_raw:
+        logger.warning(
+            "self-reply | 配置 dispatch.allow_tools / dispatch.keep_conversation "
+            "已废弃且不生效：工具集现在由 dispatch.chat_tool_mode 按 kind 收窄"
+            "（task 类始终使用核心注入的完整工具集），是否挂核心会话由 "
+            "dispatch.attach_core_conversation 控制。请到 WebUI 重新确认。"
+        )
     global_raw = _as_dict(raw.get("global_settings"))
 
     return PluginConfig(
@@ -243,8 +302,32 @@ def parse_plugin_config(raw: dict) -> PluginConfig:
         ),
         dispatch=DispatchConfig(
             mode=_sanitize_dispatch_mode(dispatch_raw.get("mode", "direct")),
-            allow_tools=_to_bool(dispatch_raw.get("allow_tools"), False),
-            keep_conversation=_to_bool(dispatch_raw.get("keep_conversation"), False),
+            attach_core_conversation=_to_bool(
+                dispatch_raw.get("attach_core_conversation"), True
+            ),
+            chat_tool_mode=_sanitize_chat_tool_mode(
+                dispatch_raw.get("chat_tool_mode"), "readonly"
+            ),
+            chat_tools=tuple(
+                _to_list(dispatch_raw.get("chat_tools"), list(DEFAULT_CHAT_TOOLS))
+            ),
+            chat_note_template=str(
+                dispatch_raw.get("chat_note_template") or DEFAULT_CHAT_NOTE_TEMPLATE
+            ),
+            task_note_template=str(
+                dispatch_raw.get("task_note_template") or DEFAULT_TASK_NOTE_TEMPLATE
+            ),
+            recent_context_lines=_to_int(
+                dispatch_raw.get("recent_context_lines"), 12
+            ),
+            recent_context_max_chars=_to_int(
+                dispatch_raw.get("recent_context_max_chars"), 1200
+            ),
+            fallback_on=_sanitize_fallback_on(dispatch_raw.get("fallback_on")),
+            fallback_text=(
+                str(dispatch_raw.get("fallback_text") or "").strip()
+                or DEFAULT_FALLBACK_TEXT
+            ),
         ),
         global_settings=GlobalSettings(
             max_origins=_to_int(global_raw.get("max_origins"), 500),

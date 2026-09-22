@@ -7,7 +7,30 @@ def test_valid_reply_json():
     out = parse_judge_output(
         '{"decision":"reply","target_ids":["123"],"reason":"被提问"}', "999"
     )
-    assert out == {"decision": "reply", "target_ids": ["123"], "reason": "被提问"}
+    assert out == {
+        "decision": "reply",
+        "target_ids": ["123"],
+        "kind": "chat",
+        "reason": "被提问",
+    }
+
+
+def test_valid_reply_json_with_kind_task():
+    out = parse_judge_output(
+        '{"decision":"reply","target_ids":["123"],"kind":"task","reason":"查一下"}', "999"
+    )
+    assert out["kind"] == "task"
+
+
+def test_kind_defaults_and_illegal_value_falls_back():
+    # 不带 kind（老输出）-> chat
+    assert parse_judge_output('{"decision":"reply","target_ids":["1"]}', "")["kind"] == "chat"
+    # 非法值 -> chat
+    assert parse_judge_output(
+        '{"decision":"reply","target_ids":["1"],"kind":"telepathy"}', ""
+    )["kind"] == "chat"
+    # 容错路径（regex / token 兜底）也要带 kind
+    assert parse_judge_output("REPLY now", "9")["kind"] == "chat"
 
 
 def test_valid_skip_json():
@@ -56,7 +79,12 @@ def test_skip_token():
 
 def test_empty_input():
     out = parse_judge_output("", "999")
-    assert out == {"decision": "skip", "target_ids": [], "reason": "empty"}
+    assert out == {
+        "decision": "skip",
+        "target_ids": [],
+        "kind": "chat",
+        "reason": "empty",
+    }
     out2 = parse_judge_output("   ", "999")
     assert out2["decision"] == "skip"
 
