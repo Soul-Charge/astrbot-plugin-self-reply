@@ -83,7 +83,7 @@ class FakeEvent:
 
 
 def _make_plugin():
-    return Main(None, {"enable": True})
+    return Main(None, {"enable": True, "whitelist": {"allowed_origins": [ORIGIN]}})
 
 
 def _drive(plugin, events):

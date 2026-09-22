@@ -71,7 +71,7 @@ def _poke_event(message_id="18599000", sender_qq="800000000"):
 
 
 def _make_plugin():
-    return Main(None, {"enable": True})
+    return Main(None, {"enable": True, "whitelist": {"allowed_origins": [ORIGIN]}})
 
 
 def _drive(plugin, events):

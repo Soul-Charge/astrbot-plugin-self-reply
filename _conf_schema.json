@@ -214,7 +214,7 @@
         "items": {
             "allowed_origins": {
                 "description": "允许的会话",
-                "hint": "unified_msg_origin 或群号列表。留空表示所有群聊均生效。",
+                "hint": "unified_msg_origin 或群号列表（精确匹配，不支持通配符）。留空表示插件关闭（不回复任何群）；需要生效必须至少填一个群。",
                 "type": "list",
                 "default": []
             }

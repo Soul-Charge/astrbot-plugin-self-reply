@@ -85,9 +85,21 @@ def _install_astrbot_stubs() -> None:
             self.sender_nickname = ""
             self.message_str = ""
 
+    class Image:
+        def __init__(self, url="", file="", **kwargs):
+            self.url = url
+            self.file = file
+            self.caption = ""
+
+    class Poke:
+        def __init__(self, id="", **kwargs):
+            self.id = id
+
     components_mod.Plain = Plain
     components_mod.At = At
     components_mod.Reply = Reply
+    components_mod.Image = Image
+    components_mod.Poke = Poke
 
     event_mod = _package("astrbot.api.event")
     filter_mod = _package("astrbot.api.event.filter")
@@ -98,7 +110,26 @@ def _install_astrbot_stubs() -> None:
 
         return wrapper
 
+    def _record_decorator(kind):
+        """记录声明式过滤器，供单测断言 /reply 挂了 ADMIN + reply 指令。"""
+
+        def deco(*args, **kwargs):
+            def wrapper(func):
+                func._dsh_filters = list(getattr(func, "_dsh_filters", [])) + [
+                    (kind, args, kwargs)
+                ]
+                return func
+
+            return wrapper
+
+        return deco
+
     filter_mod.event_message_type = _passthrough_decorator
+    filter_mod.command = _record_decorator("command")
+    filter_mod.permission_type = _record_decorator("permission_type")
+    filter_mod.on_llm_request = _passthrough_decorator
+    filter_mod.on_decorating_result = _passthrough_decorator
+    filter_mod.after_message_sent = _passthrough_decorator
     event_mod.filter = filter_mod
     event_mod.AstrMessageEvent = object
     event_mod.MessageChain = object
@@ -108,11 +139,13 @@ def _install_astrbot_stubs() -> None:
     class MessageType:
         GROUP_MESSAGE = "GroupMessage"
         FRIEND_MESSAGE = "FriendMessage"
+        OTHER_MESSAGE = "OtherMessage"
 
     platform_mod.MessageType = MessageType
 
     star_pkg_mod = _package("astrbot.api.star")
     star_pkg_mod.Context = object
+    star_pkg_mod.Star = _Star
 
     core_mod = _package("astrbot.core")
     core_star_mod = _package("astrbot.core.star")

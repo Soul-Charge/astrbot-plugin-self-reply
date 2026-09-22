@@ -45,6 +45,51 @@ from .tag_utils import (
 )
 
 MSG_ID_LINE_RE = re.compile(r"#msg(\w+)")
+_LAST_TS_RE = re.compile(r"(\d{2}):(\d{2}):(\d{2})")
+
+# ---- 自主回复总开关（仅私聊 /reply，任务书 v3）----
+KV_PAUSE_STATE_KEY = "self_reply_pause_state"
+"""KV 键：{"paused": bool, "paused_at": float|null}（全局，不按群）。"""
+PAUSE_LOG_THROTTLE_SEC = 60.0
+"""关闭态拦截日志按 origin 的节流窗口（秒）。"""
+EMPTY_WHITELIST_NOTICE = (
+    "白名单为空 → 插件已关闭（不回复任何群）。请先在配置里添加白名单。"
+)
+"""白名单留空时三个命令的统一提示（任务书 3.4 / 5.2）。"""
+
+
+def format_duration(seconds: float) -> str:
+    """把秒数格式化成 1天2小时3分4秒 的可读时长。"""
+    total = int(max(0.0, seconds))
+    days, rem = divmod(total, 86400)
+    hours, rem = divmod(rem, 3600)
+    minutes, secs = divmod(rem, 60)
+    parts: list[str] = []
+    if days:
+        parts.append(str(days) + "天")
+    if hours:
+        parts.append(str(hours) + "小时")
+    if minutes:
+        parts.append(str(minutes) + "分")
+    if secs or not parts:
+        parts.append(str(secs) + "秒")
+    return "".join(parts)
+
+
+def format_relative_time(line: str, now: float) -> str:
+    """从历史行的 [nick/id/HH:MM:SS] 取时刻，算距 now 的相对时长。"""
+    m = _LAST_TS_RE.search(line or "")
+    if not m:
+        return "无记录"
+    hh, mm, ss = (int(x) for x in m.groups())
+    try:
+        t = datetime.now().replace(hour=hh, minute=mm, second=ss, microsecond=0)
+    except ValueError:
+        return "无记录"
+    delta = now - t.timestamp()
+    if delta < 0:
+        delta += 86400  # 跨天：当作昨天同一时刻
+    return format_duration(delta) + "前"
 
 # 会话重置清理必须最先执行：AstrBot 的 hook 链一旦遇到 event.is_stopped()
 # 就会中断后续 handler（见 core/pipeline/context_utils.py），而 /reset 这类
@@ -291,9 +336,150 @@ class Main(star.Star):
         self.tracker = ReplyTracker()
         self.memory = MemoryBridge(context)
         self.dispatcher = PipelineDispatcher(context)
+        # 自主回复总开关（v3：全局，仅私聊 /reply 可切换）。这里先给内存
+        # 默认值，真实状态由 initialize() 从 KV 恢复。
+        self._paused = False
+        self._paused_at: float | None = None
+        self._pause_log_ts: dict[str, float] = {}
 
     def _cfg(self) -> PluginConfig:
         return self._config
+
+    # ---------------- 自主回复总开关（v3：全局，仅私聊 /reply） ----------------
+
+    async def initialize(self) -> None:
+        await self._load_pause_state()
+
+    async def _load_pause_state(self) -> None:
+        """启动时从 KV 恢复开关状态；KV 不可用时降级为内存态，不阻塞链路。"""
+        try:
+            raw = await self.get_kv_data(KV_PAUSE_STATE_KEY, None)
+        except Exception as e:
+            logger.error("self-reply | 读取暂停状态失败，降级为内存态: " + str(e))
+            return
+        if not isinstance(raw, dict):
+            return
+        self._paused = bool(raw.get("paused", False))
+        paused_at = raw.get("paused_at")
+        self._paused_at = (
+            float(paused_at) if isinstance(paused_at, (int, float)) else None
+        )
+        logger.info("self-reply | 自主回复开关恢复 paused=" + str(self._paused))
+
+    async def _persist_pause_state(self) -> None:
+        """写 KV；失败只记 ERROR，不影响内存态与消息链路（任务书 7.2）。"""
+        payload = {"paused": bool(self._paused), "paused_at": self._paused_at}
+        try:
+            await self.put_kv_data(KV_PAUSE_STATE_KEY, payload)
+        except Exception as e:
+            logger.error("self-reply | 写入暂停状态失败，仅内存生效: " + str(e))
+
+    async def _set_paused(self, value: bool) -> None:
+        self._paused = bool(value)
+        self._paused_at = time.time() if self._paused else None
+        if not self._paused:
+            self._pause_log_ts.clear()
+        await self._persist_pause_state()
+        logger.info("self-reply | 自主回复开关切换 paused=" + str(self._paused))
+
+    def _whitelist_origins(self) -> list[str]:
+        return list(self._cfg().whitelist.allowed_origins or [])
+
+    def _pause_status_text(self) -> str:
+        if not self._paused:
+            return "开启（正在自主回复群聊）"
+        if not self._paused_at:
+            return "关闭"
+        secs = max(0.0, time.time() - self._paused_at)
+        started = datetime.fromtimestamp(self._paused_at).strftime("%Y-%m-%d %H:%M:%S")
+        return "关闭（起始 " + started + "，已持续 " + format_duration(secs) + "）"
+
+    def _log_paused_skip(self, origin: str, reason: str = "paused") -> None:
+        """关闭态 / 白名单空拦截日志：按 origin 节流，避免刷屏。"""
+        now = time.time()
+        if now - self._pause_log_ts.get(origin, 0.0) < PAUSE_LOG_THROTTLE_SEC:
+            return
+        self._pause_log_ts[origin] = now
+        if reason == "whitelist_empty":
+            logger.info(
+                "self-reply | 白名单为空，等同于插件关闭，跳过群消息 origin=" + origin
+            )
+        else:
+            logger.info("self-reply | 自主回复已关闭，跳过群消息 origin=" + origin)
+
+    def _describe_origin(self, origin: str, now: float) -> str:
+        state = self.runtime.get(origin)
+        if state is None:
+            for key, st in self.runtime.origins.items():
+                if key == origin or key.endswith(":" + origin):
+                    state = st
+                    break
+        if state is None:
+            return origin + "：暂无活动记录"
+        last_line = state.session_chats[-1] if state.session_chats else ""
+        return (
+            origin
+            + "：历史 "
+            + str(len(state.session_chats))
+            + " 条，待判定 "
+            + str(len(state.pending_messages))
+            + " 条，最近活动 "
+            + format_relative_time(last_line, now)
+        )
+
+    def _render_reply_stat(self) -> str:
+        whitelist = self._whitelist_origins()
+        lines = [
+            "自主回复开关：" + self._pause_status_text(),
+            "白名单生效群（" + str(len(whitelist)) + "）：",
+        ]
+        now = time.time()
+        for origin in whitelist:
+            lines.append("- " + self._describe_origin(origin, now))
+        if not whitelist:
+            lines.append("- （未配置）")
+        return "\n".join(lines)
+
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @filter.command("reply")
+    async def reply_command(self, event: AstrMessageEvent):
+        """私聊 /reply on|off|stat：插件级自主回复总开关（任务书 v3）。
+
+        非管理员由框架的 PermissionTypeFilter 拦下（回权限不足 + stop_event），
+        插件内不写权限文案。群聊里不注册响应：这里直接 return，不回复、
+        不 stop_event，让事件继续走框架默认链路。
+        """
+        if event.get_message_type() != MessageType.FRIEND_MESSAGE:
+            return
+
+        args = (event.message_str or "").split()
+        arg = args[1].lower() if len(args) > 1 else ""
+
+        # 白名单留空 = 插件关闭：不做任何实际操作，只回提示（任务书 3.4 操作面）。
+        if not self._whitelist_origins():
+            if arg == "stat":
+                yield event.plain_result(
+                    EMPTY_WHITELIST_NOTICE + "\n当前开关：" + self._pause_status_text()
+                )
+            else:
+                yield event.plain_result(EMPTY_WHITELIST_NOTICE)
+            return
+
+        if arg == "on":
+            await self._set_paused(False)
+            yield event.plain_result("自主回复已开启（全局）。")
+            return
+        if arg == "off":
+            await self._set_paused(True)
+            yield event.plain_result(
+                "自主回复已关闭（全局）。关闭期间不再调用判定模型，群聊上下文仍继续积累。"
+            )
+            return
+        if arg == "stat":
+            yield event.plain_result(self._render_reply_stat())
+            return
+        # 无参数或无法识别的首参：不生效、回用法提示；多余参数静默忽略。
+        yield event.plain_result("用法：/reply on | /reply off | /reply stat")
 
     # ---------------- Hook 1: 群消息记录与防抖调度 ----------------
 
@@ -309,13 +495,16 @@ class Main(star.Star):
         if sender_id and self_id and str(sender_id) == str(self_id):
             return  # bot 自身
 
-        # whitelist
-        if cfg.whitelist.allowed_origins:
-            if event.unified_msg_origin not in cfg.whitelist.allowed_origins and (
-                event.get_group_id()
-                and event.get_group_id() not in cfg.whitelist.allowed_origins
-            ):
-                return
+        # whitelist：留空 = 插件关闭（v3 语义反转，任务书 3.4）。
+        # 影响面：线上若白名单为空，所有群会立即静默 —— 预期行为。
+        allowed_origins = cfg.whitelist.allowed_origins
+        if not allowed_origins:
+            self._log_paused_skip(event.unified_msg_origin, "whitelist_empty")
+            return
+        if event.unified_msg_origin not in allowed_origins and (
+            event.get_group_id() and event.get_group_id() not in allowed_origins
+        ):
+            return
 
         # 记录
         raw_str = (event.message_str or "").strip()
@@ -406,6 +595,11 @@ class Main(star.Star):
 
         # 唤醒消息交由主流水线响应
         if is_wake:
+            return
+
+        # 自主回复关闭：上面的 session_chats 已记录本条历史，重开后首轮
+        # 靠这个滑动窗口拿到关闭期间的上下文；但不入队、不调度。
+        if self._paused:
             return
 
         # 纯通知类事件（戳一戳、入群提示等）没有可判定的内容：
@@ -513,6 +707,11 @@ class Main(star.Star):
         if not state:
             return
         if not state.pending_messages:
+            return
+
+        # 双保险：防抖任务可能在关闭指令下达前就已创建（在途批次）。
+        # 这里再挡一次，确保 paused 期间 judge/generate 零调用。
+        if self._paused:
             return
 
         pipeline_mode = cfg.dispatch.mode == "pipeline"
