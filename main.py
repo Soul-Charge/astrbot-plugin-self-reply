@@ -341,6 +341,10 @@ class Main(star.Star):
         self._paused = False
         self._paused_at: float | None = None
         self._pause_log_ts: dict[str, float] = {}
+        # 按群关闭集合（存白名单条目原样）与观察到的群名缓存。
+        # 某群是否自主回复 = 全局未关 且 该群不在 paused_origins 里。
+        self._paused_origins: set[str] = set()
+        self._group_names: dict[str, str] = {}
 
     def _cfg(self) -> PluginConfig:
         return self._config
@@ -364,11 +368,21 @@ class Main(star.Star):
         self._paused_at = (
             float(paused_at) if isinstance(paused_at, (int, float)) else None
         )
-        logger.info("self-reply | 自主回复开关恢复 paused=" + str(self._paused))
+        raw_origins = raw.get("paused_origins") or []
+        if isinstance(raw_origins, (list, tuple, set)):
+            self._paused_origins = {str(x) for x in raw_origins}
+        logger.info(
+            "self-reply | 自主回复开关恢复 paused=" + str(self._paused)
+            + " 按群关闭=" + str(sorted(self._paused_origins))
+        )
 
     async def _persist_pause_state(self) -> None:
         """写 KV；失败只记 ERROR，不影响内存态与消息链路（任务书 7.2）。"""
-        payload = {"paused": bool(self._paused), "paused_at": self._paused_at}
+        payload = {
+            "paused": bool(self._paused),
+            "paused_at": self._paused_at,
+            "paused_origins": sorted(self._paused_origins),
+        }
         try:
             await self.put_kv_data(KV_PAUSE_STATE_KEY, payload)
         except Exception as e:
@@ -381,6 +395,56 @@ class Main(star.Star):
             self._pause_log_ts.clear()
         await self._persist_pause_state()
         logger.info("self-reply | 自主回复开关切换 paused=" + str(self._paused))
+
+    def _is_paused_origin(self, origin: str) -> bool:
+        """该 origin（umo 或纯群号）是否在按群关闭集合里。"""
+        if not self._paused_origins or not origin:
+            return False
+        if origin in self._paused_origins:
+            return True
+        # umo 形如 platform:GroupMessage:群号，按纯群号也能命中
+        return origin.rsplit(":", 1)[-1] in self._paused_origins
+
+    def _is_origin_paused(self, origin: str, group_id: str | None = None) -> bool:
+        """全局关 或 该群被按群关 ⇒ 该群不自主回复。"""
+        if self._paused:
+            return True
+        if group_id and self._is_paused_origin(str(group_id)):
+            return True
+        return self._is_paused_origin(origin)
+
+    def _remember_group_name(self, event) -> None:
+        """从群消息顺手缓存群名（零额外 API 调用，对齐任务书 Q4）。"""
+        gid = str(event.get_group_id() or "")
+        if not gid:
+            return
+        group = getattr(event.message_obj, "group", None)
+        name = str(getattr(group, "group_name", "") or "").strip()
+        if name and name != "N/A" and self._group_names.get(gid) != name:
+            self._group_names[gid] = name
+
+    def _group_id_of(self, entry: str) -> str:
+        """从白名单条目（umo 或群号）里取出群号。"""
+        return str(entry or "").rsplit(":", 1)[-1]
+
+    def _display_name(self, entry: str) -> str:
+        """群号 → 「群名（群号）」；没有群名缓存时退回群号。"""
+        gid = self._group_id_of(entry)
+        name = self._group_names.get(gid)
+        if name:
+            return name + "（" + gid + "）"
+        return gid
+
+    def _resolve_whitelist_entry(self, raw_id: str) -> str | None:
+        """把输入的群号解析成白名单里的条目；未命中返回 None。"""
+        target = str(raw_id).strip().lstrip("@")
+        if not target:
+            return None
+        for entry in self._whitelist_origins():
+            entry = str(entry)
+            if entry == target or self._group_id_of(entry) == target:
+                return entry
+        return None
 
     def _whitelist_origins(self) -> list[str]:
         return list(self._cfg().whitelist.allowed_origins or [])
@@ -411,31 +475,39 @@ class Main(star.Star):
         state = self.runtime.get(origin)
         if state is None:
             for key, st in self.runtime.origins.items():
-                if key == origin or key.endswith(":" + origin):
+                if key == origin or key.endswith(":" + self._group_id_of(origin)):
                     state = st
                     break
+        label = self._display_name(origin)
+        mark = " [按群已关]" if self._is_paused_origin(origin) else ""
         if state is None:
-            return origin + "：暂无活动记录"
+            return label + "：暂无活动记录" + mark
         last_line = state.session_chats[-1] if state.session_chats else ""
         return (
-            origin
+            label
             + "：历史 "
             + str(len(state.session_chats))
             + " 条，待判定 "
             + str(len(state.pending_messages))
             + " 条，最近活动 "
             + format_relative_time(last_line, now)
+            + mark
         )
 
     def _render_reply_stat(self) -> str:
         whitelist = self._whitelist_origins()
         lines = [
             "自主回复开关：" + self._pause_status_text(),
-            "白名单生效群（" + str(len(whitelist)) + "）：",
         ]
+        if self._paused_origins:
+            names = [self._display_name(x) for x in sorted(self._paused_origins)]
+            lines.append("按群关闭（" + str(len(names)) + "）：" + "、".join(names))
+        else:
+            lines.append("按群关闭：无")
+        lines.append("白名单生效群（" + str(len(whitelist)) + "）：")
         now = time.time()
         for origin in whitelist:
-            lines.append("- " + self._describe_origin(origin, now))
+            lines.append("- " + self._describe_origin(str(origin), now))
         if not whitelist:
             lines.append("- （未配置）")
         return "\n".join(lines)
@@ -443,43 +515,70 @@ class Main(star.Star):
     @filter.permission_type(filter.PermissionType.ADMIN)
     @filter.command("reply")
     async def reply_command(self, event: AstrMessageEvent):
-        """私聊 /reply on|off|stat：插件级自主回复总开关（任务书 v3）。
+        """私聊 /reply on|off|stat [群号]：自主回复开关（任务书 v3 + 按群扩展）。
 
-        非管理员由框架的 PermissionTypeFilter 拦下（回权限不足 + stop_event），
-        插件内不写权限文案。群聊里不注册响应：这里直接 return，不回复、
-        不 stop_event，让事件继续走框架默认链路。
+        * 不带群号：全局开关；
+        * 带群号：只改该群（群号须在白名单里），全局关闭时该设置暂不生效；
+        * 非管理员由框架 PermissionTypeFilter 拦下；
+        * 群聊里直接 return，不回复、不 stop_event，交回框架默认链路。
         """
         if event.get_message_type() != MessageType.FRIEND_MESSAGE:
             return
 
         args = (event.message_str or "").split()
-        arg = args[1].lower() if len(args) > 1 else ""
+        verb = args[1].lower() if len(args) > 1 else ""
+        target = args[2].strip() if len(args) > 2 else ""
 
         # 白名单留空 = 插件关闭：不做任何实际操作，只回提示（任务书 3.4 操作面）。
         if not self._whitelist_origins():
-            if arg == "stat":
+            if verb == "stat":
                 yield event.plain_result(
-                    EMPTY_WHITELIST_NOTICE + "\n当前开关：" + self._pause_status_text()
+                    EMPTY_WHITELIST_NOTICE + "\n" + "当前开关：" + self._pause_status_text()
                 )
             else:
                 yield event.plain_result(EMPTY_WHITELIST_NOTICE)
             return
 
-        if arg == "on":
-            await self._set_paused(False)
-            yield event.plain_result("自主回复已开启（全局）。")
-            return
-        if arg == "off":
-            await self._set_paused(True)
-            yield event.plain_result(
-                "自主回复已关闭（全局）。关闭期间不再调用判定模型，群聊上下文仍继续积累。"
-            )
-            return
-        if arg == "stat":
+        if verb == "stat":
             yield event.plain_result(self._render_reply_stat())
             return
-        # 无参数或无法识别的首参：不生效、回用法提示；多余参数静默忽略。
-        yield event.plain_result("用法：/reply on | /reply off | /reply stat")
+
+        if verb not in ("on", "off"):
+            yield event.plain_result(
+                "用法：/reply on | /reply off | /reply stat [群号]"
+            )
+            return
+
+        if not target:
+            if verb == "off":
+                await self._set_paused(True)
+                yield event.plain_result(
+                    "自主回复已关闭（全局）。关闭期间不再调用判定模型，群聊上下文仍继续积累。"
+                )
+            else:
+                await self._set_paused(False)
+                yield event.plain_result("自主回复已开启（全局）。")
+            return
+
+        # 带群号：按群操作，群号必须先落在白名单里（否则写了也不会生效）。
+        entry = self._resolve_whitelist_entry(target)
+        if entry is None:
+            yield event.plain_result(
+                "群 " + target + " 不在白名单中，未做改动。"
+            )
+            return
+
+        if verb == "off":
+            self._paused_origins.add(entry)
+            await self._persist_pause_state()
+            yield event.plain_result("已关闭群 " + self._display_name(entry) + " 的自主回复。")
+            return
+
+        self._paused_origins.discard(entry)
+        await self._persist_pause_state()
+        tail = "（注意：全局仍处于关闭状态，需先 /reply on）" if self._paused else ""
+        yield event.plain_result("已开启群 " + self._display_name(entry) + " 的自主回复。" + tail)
+
 
     # ---------------- Hook 1: 群消息记录与防抖调度 ----------------
 
@@ -597,9 +696,14 @@ class Main(star.Star):
         if is_wake:
             return
 
-        # 自主回复关闭：上面的 session_chats 已记录本条历史，重开后首轮
-        # 靠这个滑动窗口拿到关闭期间的上下文；但不入队、不调度。
-        if self._paused:
+        # 观察缓存：顺手记下群名，供 /reply stat 显示（零额外 API 调用）。
+        self._remember_group_name(event)
+
+        # 自主回复关闭（全局或按群）：上面的 session_chats 已记录本条历史，
+        # 重开后首轮靠这个滑动窗口拿到关闭期间的上下文；但不入队、不调度。
+        if self._is_origin_paused(
+            event.unified_msg_origin, event.get_group_id()
+        ):
             return
 
         # 纯通知类事件（戳一戳、入群提示等）没有可判定的内容：
@@ -710,8 +814,8 @@ class Main(star.Star):
             return
 
         # 双保险：防抖任务可能在关闭指令下达前就已创建（在途批次）。
-        # 这里再挡一次，确保 paused 期间 judge/generate 零调用。
-        if self._paused:
+        # 这里再挡一次，确保关闭期间 judge/generate 零调用。
+        if self._paused or self._is_paused_origin(origin):
             return
 
         pipeline_mode = cfg.dispatch.mode == "pipeline"

@@ -250,19 +250,21 @@ def test_reply_off_then_on_transitions_and_persists():
     out_on = collect_and_capture(plugin, FakeEvent("/reply on", message_type=MessageType.FRIEND_MESSAGE, is_admin=True))
     assert plugin._paused is False
     assert plugin._paused_at is None
-    assert writes[-1][1] == {"paused": False, "paused_at": None}
+    assert writes[-1][1] == {"paused": False, "paused_at": None, "paused_origins": []}
     assert str(out_on[0][1]).startswith("自主回复已开启")
 
 
-def test_reply_extra_parameters_are_ignored():
+def test_reply_extra_parameters_target_that_group():
+    """语义变更：带群号不再是「被忽略」，而是只关该群（全局开关不动）。"""
     plugin = make_plugin(whitelist=[GROUP_ORIGIN])
     plugin.put_kv_data = _noop_put
     out = collect_and_capture(
         plugin,
-        FakeEvent("/reply off 400000000", message_type=MessageType.FRIEND_MESSAGE, is_admin=True),
+        FakeEvent("/reply off " + GROUP_ORIGIN.rsplit(":", 1)[-1], message_type=MessageType.FRIEND_MESSAGE, is_admin=True),
     )
-    assert plugin._paused is True
-    assert str(out[0][1]).startswith("自主回复已关闭")
+    assert plugin._paused is False  # 全局不受影响
+    assert plugin._paused_origins == {GROUP_ORIGIN}
+    assert str(out[0][1]).startswith("已关闭群")
 
 
 def test_reply_without_args_shows_usage_and_changes_nothing():
