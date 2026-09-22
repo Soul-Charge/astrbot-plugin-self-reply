@@ -14,7 +14,7 @@ GROUP_B = "200000000"
 ORIGIN_A = "bot:GroupMessage:400000000"
 ORIGIN_B = "bot:GroupMessage:200000000"
 PRIVATE_ORIGIN = "bot:FriendMessage:8000000000"
-GROUP_NAMES = {GROUP_A: "bot", GROUP_B: "技术群"}
+GROUP_NAMES = {GROUP_A: "测试群", GROUP_B: "测试群B"}
 
 PROVIDER_CALLS = []
 
@@ -149,11 +149,13 @@ def test_per_group_off_records_and_persists():
     assert GROUP_A in plugin._paused_origins
     assert writes[-1][0] == KV_PAUSE_STATE_KEY
     assert writes[-1][1]["paused_origins"] == [GROUP_A]
-    assert "已关闭群" in str(out[0][1])
-    # 群名已知时提示里应带群名（先缓存再操作）
-    plugin._group_names[GROUP_B] = "技术群"
-    out2 = run_command(plugin, "/reply off " + GROUP_B)
-    assert "技术群" in str(out2[0][1])
+    # 群名未缓存时退回纯群号
+    assert "已关闭群 " + GROUP_A in str(out[0][1])
+    assert "（" not in str(out[0][1])
+    # 缓存了群名之后，提示里应带群名
+    plugin._group_names[GROUP_B] = "测试群B"
+    out2 = run_command(plugin, "/reply on " + GROUP_B)
+    assert "测试群B" in str(out2[0][1])
 
 
 def test_per_group_on_removes_and_persists():
@@ -264,7 +266,7 @@ def test_global_off_still_blocks_all_groups():
 def test_group_name_cached_from_group_message():
     plugin = make_plugin()
     feed_group(plugin, [FakeEvent("hi", message_id="1", group_id=GROUP_A)])
-    assert plugin._group_names.get(GROUP_A) == "bot"
+    assert plugin._group_names.get(GROUP_A) == "测试群"
 
 
 def test_group_name_not_cached_for_na():
@@ -283,7 +285,7 @@ def test_stat_shows_group_name_and_per_group_mark():
     run_command(plugin, "/reply off " + GROUP_A)
     out = run_command(plugin, "/reply stat")
     text = str(out[0][1])
-    assert "bot（" + GROUP_A + "）" in text
+    assert "测试群（" + GROUP_A + "）" in text
     assert "按群关闭" in text
     assert "[按群已关]" in text
     # 未缓存的群退回群号显示
@@ -293,8 +295,8 @@ def test_stat_shows_group_name_and_per_group_mark():
 def test_display_name_falls_back_to_group_id():
     plugin = make_plugin()
     assert plugin._display_name(GROUP_A) == GROUP_A
-    plugin._group_names[GROUP_A] = "bot"
-    assert plugin._display_name(GROUP_A) == "bot（" + GROUP_A + "）"
+    plugin._group_names[GROUP_A] = "测试群"
+    assert plugin._display_name(GROUP_A) == "测试群（" + GROUP_A + "）"
 
 
 def test_resolve_whitelist_entry_variants():
