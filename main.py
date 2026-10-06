@@ -57,6 +57,32 @@ EMPTY_WHITELIST_NOTICE = (
 )
 """白名单留空时三个命令的统一提示（任务书 3.4 / 5.2）。"""
 
+#: 插话路径的动图帧拼图说明：核心把多帧 GIF 转成一张按阅读顺序排列的帧拼图，
+#: 但插话路径上 media_montage 的提示钩子看不到图（图片由本插件后注入），
+#: 所以由本插件在源头补一句。只告知"这是同一动图的采样帧"，不指定内容风格。
+GIF_FRAMES_NOTICE = (
+    "The attached image is a stitched sequence of frames sampled from one "
+    "animated image (GIF). Treat it as a single animation, not as separate "
+    "pictures; do not mention the grid or frame layout."
+)
+
+
+def _looks_animated(ref: str) -> bool:
+    """粗判动图：零 IO、零依赖；误判代价仅为多加一句提示。
+
+    注意：本插件的 image_resolver.resolve() 会把本地文件转成 data URL
+    （形如 data:image/gif;base64,...），此时原始 .gif 扩展名已经消失，
+    所以除扩展名外还必须认 MIME，否则提示在真实链路上永不触发。
+    """
+    if not isinstance(ref, str):
+        return False
+    lowered = ref.lower()
+    if lowered.startswith("data:image/gif"):
+        return True
+    # http URL 可能带查询串/片段，先剥掉再看扩展名
+    head = lowered.split("?", 1)[0].split("#", 1)[0]
+    return head.endswith(".gif")
+
 
 def format_duration(seconds: float) -> str:
     """把秒数格式化成 1天2小时3分4秒 的可读时长。"""
@@ -1600,6 +1626,10 @@ class Main(star.Star):
         self._strip_self_identity_reminder(req, job)
         if job.image_urls:
             req.image_urls = list(job.image_urls)
+            # 动图在源头判：图片由本插件后注入，media_montage 的提示钩子
+            # 在插话路径上根本看不到图（核心拼图发生在所有钩子之后）。
+            if any(_looks_animated(u) for u in req.image_urls):
+                self._append_gif_notice(req)
         if not cfg.dispatch.attach_core_conversation:
             # 不挂核心会话：避免插话提示词被写进核心对话历史
             req.conversation = None
@@ -1709,6 +1739,46 @@ class Main(star.Star):
                 logger.warning(
                     f"self-reply | 重写 system_reminder 失败（保留原文）: {e}"
                 )
+
+    def _append_gif_notice(self, req) -> None:
+        """把「这是同一动图的采样帧」提示追加到 req.extra_user_content_parts。
+
+        写法照抄 astrbot_plugin_media_montage 的 _append_notice：插话路径上图片
+        由本插件后注入，核心的动图拼图提示钩子看不到图，所以在这里补一句。
+        全链路静默降级：任何异常都只 debug，绝不影响插话主流程。
+        """
+        try:
+            from astrbot.core.agent.message import TextPart
+        except Exception:
+            try:
+                from astrbot.api.message_components import Plain as TextPart  # type: ignore
+            except Exception:
+                logger.debug("self-reply | 无法构造 TextPart，跳过动图提示。")
+                return
+
+        try:
+            part = TextPart(
+                text="<system_notice>\n" + GIF_FRAMES_NOTICE + "\n</system_notice>"
+            )
+        except Exception as e:  # noqa: BLE001
+            logger.debug(f"self-reply | 构造动图提示失败（跳过）: {e}")
+            return
+
+        marker = getattr(part, "mark_as_temp", None)
+        if callable(marker):
+            try:
+                part = marker() or part
+            except Exception:
+                pass
+
+        extra = getattr(req, "extra_user_content_parts", None)
+        if not isinstance(extra, list):
+            logger.debug("self-reply | extra_user_content_parts 不是 list，跳过动图提示。")
+            return
+        try:
+            extra.append(part)
+        except Exception as e:  # noqa: BLE001
+            logger.debug(f"self-reply | 追加动图提示失败（跳过）: {e}")
 
     @filter.on_decorating_result()
     async def on_pipeline_decorating_result(self, event: AstrMessageEvent) -> None:
